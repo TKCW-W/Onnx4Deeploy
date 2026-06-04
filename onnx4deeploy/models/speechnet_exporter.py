@@ -50,6 +50,11 @@ class SpeechNetExporter(BaseONNXExporter):
             "n_batches": 4,
             "n_accum": 1,
             "data_size": None,
+            "data_path":  "/app/SilentWear_data/data_raw_and_filt",
+            "subject":    "S01",
+            "session":    3,
+            "batch":      1,
+            "condition":  "vocalized",
         }
 
         if hasattr(self, "_config_overrides") and self._config_overrides:
@@ -126,6 +131,27 @@ class SpeechNetExporter(BaseONNXExporter):
             print(f"   Frozen: {frozen[:5]}{'...' if len(frozen) > 5 else ''}")
         return requires_grad
 
+
+    # ------------------------------------------------------------------ #
+    # Return the data source for training mini-batch generation          #
+    # ------------------------------------------------------------------ #
+    def get_data_source(self):
+        dataset = self.config.get("dataset", "random")
+        if dataset == "silentwear":
+            from ..data.silentwear_datasource import SilentWearDataSource
+            cfg = self.config
+            return SilentWearDataSource(
+                data_path=cfg["data_path"],
+                subject=cfg.get("subject", "S01"),
+                session=cfg.get("session", 1),
+                batch=cfg.get("batch", 1),
+                condition=cfg.get("condition", "vocalized"),
+                window_samples=cfg.get("time_steps", 700),
+            )
+        from ..data.random_datasource import RandomDataSource
+        return RandomDataSource()
+
+
     # ------------------------------------------------------------------ #
     # Inference test data                                                  #
     # ------------------------------------------------------------------ #
@@ -190,14 +216,19 @@ class SpeechNetExporter(BaseONNXExporter):
             else n_batches
         )
 
-        rng = np.random.default_rng(42)
-        test_inputs = [
-            rng.standard_normal(input_shape).astype(np.float32) for _ in range(effective_data_size)
-        ]
-        labels_list = [
-            rng.integers(0, num_classes, size=(input_shape[0],)).astype(np.int64)
-            for _ in range(effective_data_size)
-        ]
+        # rng = np.random.default_rng(42)
+        # test_inputs = [
+        #     rng.standard_normal(input_shape).astype(np.float32) for _ in range(effective_data_size)
+        # ]
+        # labels_list = [
+        #     rng.integers(0, num_classes, size=(input_shape[0],)).astype(np.int64)
+        #     for _ in range(effective_data_size)
+        # ]
+
+        ### Use real data set from SilentWear for training data
+        data_source = self.get_data_source()
+        test_inputs, labels_list = data_source.load_batches(effective_data_size, input_shape, num_classes, seed=42)
+
 
         init_map: dict = self._load_init_map(self.paths["network_infer"])
 

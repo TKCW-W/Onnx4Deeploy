@@ -701,11 +701,12 @@ Examples:
         "--dataset",
         type=str,
         default="random",
-        choices=["random", "mnist"],
+        choices=["random", "mnist", "silentwear"],
         dest="dataset",
         help="Data source for training test data. "
         "'random' (default): random Gaussian inputs. "
-        "'mnist': real MNIST images (downloaded automatically if needed).",
+        "'mnist': real MNIST images (downloaded automatically if needed)."
+        "'silentwear': real dataset from SilentWear for SpeechNet ",
     )
     parser.add_argument(
         "--data-path",

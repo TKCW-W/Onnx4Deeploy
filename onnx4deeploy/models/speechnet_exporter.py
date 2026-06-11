@@ -50,6 +50,8 @@ class SpeechNetExporter(BaseONNXExporter):
             "n_batches": 4,
             "n_accum": 1,
             "data_size": None,
+            "pretrained_weights": None,       # path to .pt checkpoint
+            "pretrained_key": "model_state_dict",  # key inside the checkpoint dict
             "data_path":  "/app/SilentWear_data/data_raw_and_filt",
             "subject":    "S01",
             "session":    3,
@@ -70,11 +72,19 @@ class SpeechNetExporter(BaseONNXExporter):
     def create_model(self) -> torch.nn.Module:
         from .pytorch_models.speechnet.speechnet import SpeechNetDeploy
 
-        return SpeechNetDeploy(
+        model = SpeechNetDeploy(
             num_channels=self.model_config["num_channels"],
             time_steps=self.model_config["time_steps"],
             num_classes=self.model_config["num_classes"],
         )
+        ckpt_path = self.model_config.get("pretrained_weights")
+        if ckpt_path:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            key = self.model_config.get("pretrained_key")
+            state_dict = ckpt[key] if (key and isinstance(ckpt, dict) and key in ckpt) else ckpt
+            model.load_state_dict(state_dict, strict=True)
+            print(f"  Loaded pretrained weights from {ckpt_path}")
+        return model
 
     # ------------------------------------------------------------------ #
     # Shape helpers                                                        #
@@ -138,7 +148,7 @@ class SpeechNetExporter(BaseONNXExporter):
     def get_data_source(self):
         dataset = self.config.get("dataset", "random")
         if dataset == "silentwear":
-            from ..data.silentwear_datasource import SilentWearDataSource
+            from ..data.silent_wear_datasource import SilentWearDataSource
             cfg = self.config
             return SilentWearDataSource(
                 data_path=cfg["data_path"],
@@ -147,6 +157,7 @@ class SpeechNetExporter(BaseONNXExporter):
                 batch=cfg.get("batch", 1),
                 condition=cfg.get("condition", "vocalized"),
                 window_samples=cfg.get("time_steps", 700),
+                downsample_rest=True,
             )
         from ..data.random_datasource import RandomDataSource
         return RandomDataSource()
@@ -157,6 +168,10 @@ class SpeechNetExporter(BaseONNXExporter):
     # ------------------------------------------------------------------ #
 
     def save_test_data(self, model: torch.nn.Module, save_dir: str):
+        if self.config.get("dataset", "random") == "silentwear":
+            self._save_silentwear_eval_data(model, save_dir)
+            return
+
         print("  Saving inference test data...")
         input_shape = self.get_input_shape()
         test_input = np.random.randn(*input_shape).astype(np.float32)
@@ -173,6 +188,50 @@ class SpeechNetExporter(BaseONNXExporter):
         np.savez(save_path / "inputs.npz", input=test_input)
         np.savez(save_path / "outputs.npz", output=test_output)
         print(f"   Input: {test_input.shape}  Output: {test_output.shape}")
+
+    def _save_silentwear_eval_data(self, model: torch.nn.Module, save_dir: str):
+        print("  Saving SilentWear inference test data...")
+        from ..data.silent_wear_datasource import SilentWearDataSource
+
+        cfg = self.config
+        ds = SilentWearDataSource(
+            data_path=cfg["data_path"],
+            subject=cfg.get("subject", "S01"),
+            session=cfg.get("session", 3),
+            batch=cfg.get("batch", 1),
+            condition=cfg.get("condition", "vocalized"),
+            window_samples=cfg.get("time_steps", 700),
+            downsample_rest=True,
+        )
+        inputs, labels = ds._load_windows()
+
+        # --- test data (one sample, matches original format exactly) ---
+        test_input = inputs[0]   # (1, 1, 14, time)
+        model.eval()
+        with torch.no_grad():
+            test_output = model(torch.from_numpy(test_input)).numpy()
+
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        np.savez(save_path / "inputs.npz",  input=test_input)
+        np.savez(save_path / "outputs.npz", output=test_output)
+        print(f"   Input: {test_input.shape}  Output: {test_output.shape}  Label: {int(labels[0][0])}")
+
+        # --- accuracy over all windows ---
+        all_outputs = []
+        with torch.no_grad():
+            for x in inputs:
+                all_outputs.append(model(torch.from_numpy(x)).numpy())
+        preds      = np.argmax(np.concatenate(all_outputs, axis=0), axis=-1)
+        labels_arr = np.concatenate(labels, axis=0)
+        classes    = np.unique(labels_arr)
+        per_class_recall = np.array(
+            [np.mean(preds[labels_arr == c] == c) for c in classes]
+        )
+        balanced_acc = per_class_recall.mean()
+        print(f"   Balanced accuracy = {balanced_acc:.4f} ({balanced_acc * 100:.1f}%)  ({len(inputs)} windows)")
+        for c, r in zip(classes, per_class_recall):
+            print(f"     class {int(c)}: recall = {r:.3f}")
 
     # ------------------------------------------------------------------ #
     # Training test data                                                   #

@@ -54,11 +54,13 @@ class SpeechNetDeploy(nn.Module):
         time_steps: int = 700,
         num_classes: int = 9,
         blocks_config: Optional[List[Dict[str, Any]]] = None,
+        use_maxpool: bool = False,
     ):
         super().__init__()
         self.num_channels = num_channels
         self.time_steps = time_steps
         self.num_classes = num_classes
+        self.use_maxpool = use_maxpool
 
         if blocks_config is None:
             blocks_config = [
@@ -90,7 +92,11 @@ class SpeechNetDeploy(nn.Module):
                 ),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=False),
-                nn.AvgPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t)),
+                (
+                    nn.MaxPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
+                    if use_maxpool
+                    else nn.AvgPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
+                ),
             ]
 
             self.blocks.append(nn.Sequential(*layers))

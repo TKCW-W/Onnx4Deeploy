@@ -380,6 +380,11 @@ def generate_model(
     lora_r: Optional[int] = None,
     lora_alpha: Optional[int] = None,
     training_strategy: Optional[str] = None,
+    pretrained_weights: Optional[str] = None,
+    subject: Optional[str] = None,
+    session: Optional[int] = None,
+    batch: Optional[int] = None,
+    condition: Optional[str] = None,
 ):
     """Generate model ONNX"""
     print(f"\n{'='*70}")
@@ -479,6 +484,16 @@ def generate_model(
             exporter._config_overrides["lora_alpha"] = lora_alpha
         if training_strategy is not None:
             exporter._config_overrides["training_strategy"] = training_strategy
+        if pretrained_weights is not None:
+            exporter._config_overrides["pretrained_weights"] = pretrained_weights
+        if subject is not None:
+            exporter._config_overrides["subject"] = subject
+        if session is not None:
+            exporter._config_overrides["session"] = session
+        if batch is not None:
+            exporter._config_overrides["batch"] = batch
+        if condition is not None:
+            exporter._config_overrides["condition"] = condition
 
         # Apply model-specific configuration via _config_overrides so it survives
         # the internal load_config() call inside export_inference/export_training().
@@ -787,6 +802,49 @@ Examples:
         help="(train mode, --use-lora) LoRA scaling numerator; effective scale = alpha / r. "
         "Default: 16.",
     )
+    parser.add_argument(
+        "--pretrained-weights",
+        type=str,
+        default=None,
+        dest="pretrained_weights",
+        metavar="PATH",
+        help="Path to a pretrained .pt checkpoint whose weights are loaded before "
+        "export and baked into the ONNX initializers. "
+        "For SpeechNet the checkpoint key is 'model_state_dict'.",
+    )
+
+    parser.add_argument(
+        "--subject",
+        type=str,
+        default=None,
+        dest="subject",
+        metavar="ID",
+        help="(silentwear) Subject ID, e.g. S01, S02, S03, S04. Default: S01.",
+    )
+    parser.add_argument(
+        "--session",
+        type=int,
+        default=None,
+        dest="session",
+        metavar="N",
+        help="(silentwear) Recording session number (1, 2, or 3). Default: 3.",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=None,
+        dest="batch",
+        metavar="N",
+        help="(silentwear) Batch number within the session (1–5). Default: 1.",
+    )
+    parser.add_argument(
+        "--condition",
+        type=str,
+        default=None,
+        dest="condition",
+        choices=["vocalized", "silent"],
+        help="(silentwear) Speech condition: vocalized or silent. Default: vocalized.",
+    )
 
     # Other options
     parser.add_argument("--examples", action="store_true", help="Show usage examples")
@@ -851,6 +909,11 @@ Examples:
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             training_strategy=args.training_strategy,
+            pretrained_weights=args.pretrained_weights,
+            subject=args.subject,
+            session=args.session,
+            batch=args.batch,
+            condition=args.condition,
         )
 
 

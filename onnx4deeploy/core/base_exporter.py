@@ -527,6 +527,18 @@ class BaseONNXExporter(ABC):
 
         print("📦 Creating PyTorch model...")
         model = self.create_model()
+
+        # Snapshot BN running stats before model.train(): the ONNX tracing forward
+        # pass runs in training mode and updates running_mean/running_var via EMA
+        # in-place, corrupting pretrained stats before they are frozen into the graph.
+        bn_stats: dict = {}
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                bn_stats[name] = {
+                    "running_mean": module.running_mean.clone(),
+                    "running_var":  module.running_var.clone(),
+                }
+
         model.train()  # training=TrainingMode.TRAINING export requires train() mode
         self._model = model
 
@@ -541,6 +553,21 @@ class BaseONNXExporter(ABC):
         opset_version = max(self.config.get("opset_version", 13), 13)
         print(f"\n📤 Exporting to ONNX (opset {opset_version}, training mode)...")
         onnx_model = self._export_to_onnx(model, input_tensor, opset_version, training_mode=True)
+
+        # Restore snapshotted BN running stats into the ONNX initializers, overwriting
+        # the EMA-corrupted values produced by the tracing forward pass.
+        if bn_stats:
+            from onnx import numpy_helper
+            init_index = {init.name: init for init in onnx_model.graph.initializer}
+            for bn_name, stats in bn_stats.items():
+                for suffix, tensor in (("running_mean", stats["running_mean"]),
+                                       ("running_var",  stats["running_var"])):
+                    key = f"{bn_name}.{suffix}"  # dots preserved — RenameNodesPass runs later
+                    if key in init_index:
+                        init_index[key].CopyFrom(
+                            numpy_helper.from_array(tensor.numpy(), name=key)
+                        )
+
         onnx.save(onnx_model, self.paths["network_infer"])
         print(f"✅ Inference ONNX saved: {self.paths['network_infer']}")
 

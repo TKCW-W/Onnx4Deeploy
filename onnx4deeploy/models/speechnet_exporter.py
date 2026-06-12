@@ -205,23 +205,22 @@ class SpeechNetExporter(BaseONNXExporter):
         )
         inputs, labels = ds._load_windows()
 
-        # --- test data (one sample, matches original format exactly) ---
-        test_input = inputs[0]   # (1, 1, 14, time)
+        # --- run model on all windows, save full batch ---
         model.eval()
-        with torch.no_grad():
-            test_output = model(torch.from_numpy(test_input)).numpy()
-
-        save_path = Path(save_dir)
-        save_path.mkdir(parents=True, exist_ok=True)
-        np.savez(save_path / "inputs.npz",  input=test_input)
-        np.savez(save_path / "outputs.npz", output=test_output)
-        print(f"   Input: {test_input.shape}  Output: {test_output.shape}  Label: {int(labels[0][0])}")
-
-        # --- accuracy over all windows ---
         all_outputs = []
         with torch.no_grad():
             for x in inputs:
                 all_outputs.append(model(torch.from_numpy(x)).numpy())
+
+        all_inputs_np  = np.concatenate(inputs,      axis=0)  # (N, 1, 14, 700)
+        all_outputs_np = np.concatenate(all_outputs, axis=0)  # (N, 9)
+        labels_np      = np.concatenate(labels,      axis=0)  # (N,)
+
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        np.savez(save_path / "inputs.npz",  input=all_inputs_np,  label=labels_np)
+        np.savez(save_path / "outputs.npz", output=all_outputs_np)
+        print(f"   Inputs: {all_inputs_np.shape}  Outputs: {all_outputs_np.shape}  ({len(inputs)} windows)")
         preds      = np.argmax(np.concatenate(all_outputs, axis=0), axis=-1)
         labels_arr = np.concatenate(labels, axis=0)
         classes    = np.unique(labels_arr)

@@ -148,6 +148,12 @@ class SilentWearDataSource(DataSource):
             offset = (len(seg) - self.window_samples) // 2
             window = seg[offset : offset + self.window_samples]  # (window_samples, 14)
 
+            # Per-window scalar normalization: subtract mean and divide by std
+            # computed across all 14×window_samples values (matches fine-tuning preprocessing).
+            mean = window.mean()
+            std  = window.std()
+            window = (window - mean) / (std + 1e-8)
+
             # Reshape to SpeechNet input format: (batch, in_channels, height, width)
             # = (1, 1, 14, window_samples)
             # .T transposes (window_samples, 14) → (14, window_samples)

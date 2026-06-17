@@ -57,6 +57,7 @@ class SpeechNetExporter(BaseONNXExporter):
             "session":    3,
             "batch":      1,
             "condition":  "vocalized",
+            "stratified_sampling": False,
         }
 
         if hasattr(self, "_config_overrides") and self._config_overrides:
@@ -158,6 +159,7 @@ class SpeechNetExporter(BaseONNXExporter):
                 condition=cfg.get("condition", "vocalized"),
                 window_samples=cfg.get("time_steps", 700),
                 downsample_rest=True,
+                stratified_split=cfg.get("stratified_sampling", False),
             )
         from ..data.random_datasource import RandomDataSource
         return RandomDataSource()

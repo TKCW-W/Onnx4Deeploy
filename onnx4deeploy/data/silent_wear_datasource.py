@@ -69,6 +69,7 @@ class SilentWearDataSource(DataSource):
         condition: str = "vocalized",
         window_samples: int = 700,
         downsample_rest: bool = False,
+        stratified_split: bool = False,
     ):
         self.data_path = Path(data_path)
         self.subject = subject
@@ -77,6 +78,7 @@ class SilentWearDataSource(DataSource):
         self.condition = condition
         self.window_samples = window_samples
         self.downsample_rest = downsample_rest
+        self.stratified_split = stratified_split
 
         # Cache: populated on first call to _load_windows()
         # so the h5 file is only read once even if load_batches() is called
@@ -242,12 +244,38 @@ class SilentWearDataSource(DataSource):
         # so we never modify the global numpy random state.
         rng = np.random.RandomState(seed)
 
-        # Sample n_batches indices from the available windows.
-        # replace=True when n_batches > len(inputs) to avoid errors.
-        idx = rng.choice(
-            len(inputs),
-            size=n_batches,
-            replace=len(inputs) < n_batches,
-        )
+        if self.stratified_split:
+            # Group window indices by class, then sample n_batches // n_classes
+            # from each class so every class is equally represented.
+            from collections import defaultdict
+            class_to_idx = defaultdict(list)
+            for i, lbl in enumerate(labels):
+                class_to_idx[int(lbl[0])].append(i)
+            n_classes = len(class_to_idx)
+            n_per_class = n_batches // n_classes
+            assert n_per_class > 0, (
+                f"n_batches={n_batches} too small for {n_classes} classes "
+                f"(need at least {n_classes})"
+            )
+            selected = []
+            for cls in sorted(class_to_idx):
+                cls_idx = class_to_idx[cls]
+                chosen = rng.choice(
+                    cls_idx,
+                    size=min(n_per_class, len(cls_idx)),
+                    replace=len(cls_idx) < n_per_class,
+                ).tolist()
+                selected.extend(chosen)
+            rng.shuffle(selected)
+            print(f"   Stratified split: {n_per_class} samples/class × {n_classes} classes = {len(selected)} total")
+            idx = selected
+        else:
+            # Sample n_batches indices from the available windows.
+            # replace=True when n_batches > len(inputs) to avoid errors.
+            idx = rng.choice(
+                len(inputs),
+                size=n_batches,
+                replace=len(inputs) < n_batches,
+            ).tolist()
 
         return [inputs[i] for i in idx], [labels[i] for i in idx]

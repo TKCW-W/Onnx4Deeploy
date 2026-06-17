@@ -385,6 +385,7 @@ def generate_model(
     session: Optional[int] = None,
     batch: Optional[int] = None,
     condition: Optional[str] = None,
+    stratified_sampling: bool = False,
 ):
     """Generate model ONNX"""
     print(f"\n{'='*70}")
@@ -494,6 +495,8 @@ def generate_model(
             exporter._config_overrides["batch"] = batch
         if condition is not None:
             exporter._config_overrides["condition"] = condition
+        if stratified_sampling:
+            exporter._config_overrides["stratified_sampling"] = True
 
         # Apply model-specific configuration via _config_overrides so it survives
         # the internal load_config() call inside export_inference/export_training().
@@ -845,6 +848,15 @@ Examples:
         choices=["vocalized", "silent"],
         help="(silentwear) Speech condition: vocalized or silent. Default: vocalized.",
     )
+    parser.add_argument(
+        "--stratified",
+        action="store_true",
+        default=False,
+        dest="stratified_sampling",
+        help="(silentwear) Use stratified sampling so each class contributes equally "
+        "to the data pool. Pool size (--data-size) should be divisible by the number "
+        "of classes (9 for SpeechNet).",
+    )
 
     # Other options
     parser.add_argument("--examples", action="store_true", help="Show usage examples")
@@ -914,6 +926,7 @@ Examples:
             session=args.session,
             batch=args.batch,
             condition=args.condition,
+            stratified_sampling=args.stratified_sampling,
         )
 
 

@@ -81,6 +81,19 @@ class SpeechNetDeploy(nn.Module):
             pool_c, pool_t = cfg.get("pool", (1, 1))
             pool_c, pool_t = int(pool_c), int(pool_t)
 
+            # A (1, 1) pool with stride (1, 1) is a mathematical identity (the paper
+            # uses "no pooling" for those blocks). Emit nn.Identity() instead of a real
+            # pool so the ONNX graph carries no degenerate MaxPool/MaxPoolGrad nodes —
+            # these otherwise trigger a degenerate tile (input shape == output shape) in
+            # Deeploy's MaxPoolGradCTileConstraint. Identity has no params, so the index
+            # of blocks.N.3 and the loaded state_dict are unchanged.
+            if pool_c == 1 and pool_t == 1:
+                pool_layer: nn.Module = nn.Identity()
+            elif use_maxpool:
+                pool_layer = nn.MaxPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
+            else:
+                pool_layer = nn.AvgPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
+
             layers: List[nn.Module] = [
                 nn.Conv2d(
                     in_ch,
@@ -92,11 +105,7 @@ class SpeechNetDeploy(nn.Module):
                 ),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=False),
-                (
-                    nn.MaxPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
-                    if use_maxpool
-                    else nn.AvgPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
-                ),
+                pool_layer,
             ]
 
             self.blocks.append(nn.Sequential(*layers))

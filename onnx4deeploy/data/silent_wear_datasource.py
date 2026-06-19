@@ -70,6 +70,7 @@ class SilentWearDataSource(DataSource):
         window_samples: int = 700,
         downsample_rest: bool = False,
         stratified_split: bool = False,
+        normalize: bool = True,
     ):
         self.data_path = Path(data_path)
         self.subject = subject
@@ -79,6 +80,7 @@ class SilentWearDataSource(DataSource):
         self.window_samples = window_samples
         self.downsample_rest = downsample_rest
         self.stratified_split = stratified_split
+        self.normalize = normalize
 
         # Cache: populated on first call to _load_windows()
         # so the h5 file is only read once even if load_batches() is called
@@ -150,11 +152,10 @@ class SilentWearDataSource(DataSource):
             offset = (len(seg) - self.window_samples) // 2
             window = seg[offset : offset + self.window_samples]  # (window_samples, 14)
 
-            # Per-window scalar normalization: subtract mean and divide by std
-            # computed across all 14×window_samples values (matches fine-tuning preprocessing).
-            mean = window.mean()
-            std  = window.std()
-            window = (window - mean) / (std + 1e-8)
+            if self.normalize:
+                mean = window.mean()
+                std  = window.std()
+                window = (window - mean) / (std + 1e-8)
 
             # Reshape to SpeechNet input format: (batch, in_channels, height, width)
             # = (1, 1, 14, window_samples)

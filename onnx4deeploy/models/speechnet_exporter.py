@@ -52,6 +52,10 @@ class SpeechNetExporter(BaseONNXExporter):
             "data_size": None,
             "pretrained_weights": None,       # path to .pt checkpoint
             "pretrained_key": "model_state_dict",  # key inside the checkpoint dict
+            "use_maxpool": False,             # True = MaxPool (paper), False = AvgPool (deployment)
+            "normalize_input": True,          # False = raw EMG (must match training preprocessing)
+            "bn_recalibrate": False,          # recompute BN stats for AvgPool when using MaxPool weights
+            "bn_calib_sessions": [1, 2],      # sessions used for BN recalibration (keep deploy sess held out)
             "data_path":  "/app/SilentWear_data/data_raw_and_filt",
             "subject":    "S01",
             "session":    3,
@@ -77,6 +81,7 @@ class SpeechNetExporter(BaseONNXExporter):
             num_channels=self.model_config["num_channels"],
             time_steps=self.model_config["time_steps"],
             num_classes=self.model_config["num_classes"],
+            use_maxpool=self.model_config.get("use_maxpool", False),
         )
         ckpt_path = self.model_config.get("pretrained_weights")
         if ckpt_path:
@@ -85,7 +90,65 @@ class SpeechNetExporter(BaseONNXExporter):
             state_dict = ckpt[key] if (key and isinstance(ckpt, dict) and key in ckpt) else ckpt
             model.load_state_dict(state_dict, strict=True)
             print(f"  Loaded pretrained weights from {ckpt_path}")
+
+        # When deploying MaxPool-trained weights on the AvgPool architecture, the
+        # BatchNorm running statistics are calibrated for MaxPool-scale activations
+        # and the downstream conv inputs change scale/shape under AvgPool. This
+        # collapses every prediction to class 0. Recalibrating BN running stats on
+        # calibration data (default: the training sessions, so the deployment
+        # session stays zero-shot) recovers most of the lost accuracy without any
+        # gradient training.
+        if self.model_config.get("bn_recalibrate", False):
+            self._recalibrate_batchnorm(model)
         return model
+
+    def _recalibrate_batchnorm(self, model: torch.nn.Module) -> None:
+        """Reset BN running stats and recompute them with forward passes on
+        calibration windows (cumulative average, no labels, no gradients)."""
+        import torch.nn as nn
+        from ..data.silent_wear_datasource import SilentWearDataSource
+
+        cfg = self.config
+        calib_sessions = cfg.get("bn_calib_sessions", [1, 2])
+        print(f"  BN recalibration on sessions {calib_sessions} "
+              f"(deployment session {cfg.get('session', 3)} stays zero-shot)...")
+
+        windows: List[np.ndarray] = []
+        for sess in calib_sessions:
+            for b in range(1, 6):
+                ds = SilentWearDataSource(
+                    data_path=cfg["data_path"],
+                    subject=cfg.get("subject", "S01"),
+                    session=sess,
+                    batch=b,
+                    condition=cfg.get("condition", "vocalized"),
+                    window_samples=cfg.get("time_steps", 700),
+                    downsample_rest=True,
+                    normalize=cfg.get("normalize_input", True),
+                )
+                h5 = (Path(cfg["data_path"]) / cfg.get("subject", "S01")
+                      / cfg.get("condition", "vocalized")
+                      / f"sess_{sess}_batch_{b}.h5")
+                if not h5.exists():
+                    continue
+                xs, _ = ds._load_windows()
+                windows.extend(xs)
+
+        if not windows:
+            print("   No calibration windows found — skipping BN recalibration.")
+            return
+
+        for mod in model.modules():
+            if isinstance(mod, nn.BatchNorm2d):
+                mod.reset_running_stats()
+                mod.momentum = None  # cumulative moving average
+
+        model.train()
+        with torch.no_grad():
+            for w in windows:
+                model(torch.from_numpy(w))
+        model.eval()
+        print(f"   BN recalibrated on {len(windows)} calibration windows.")
 
     # ------------------------------------------------------------------ #
     # Shape helpers                                                        #
@@ -160,6 +223,7 @@ class SpeechNetExporter(BaseONNXExporter):
                 window_samples=cfg.get("time_steps", 700),
                 downsample_rest=True,
                 stratified_split=cfg.get("stratified_sampling", False),
+                normalize=cfg.get("normalize_input", True),
             )
         from ..data.random_datasource import RandomDataSource
         return RandomDataSource()
@@ -204,6 +268,7 @@ class SpeechNetExporter(BaseONNXExporter):
             condition=cfg.get("condition", "vocalized"),
             window_samples=cfg.get("time_steps", 700),
             downsample_rest=True,
+            normalize=cfg.get("normalize_input", True),
         )
         inputs, labels = ds._load_windows()
 

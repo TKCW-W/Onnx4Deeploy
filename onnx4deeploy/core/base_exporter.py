@@ -658,6 +658,15 @@ class BaseONNXExporter(ABC):
         shutil.copy(self.paths["network_train_optim"], self.paths["network"])
         print(f"✅ Final model: {self.paths['network']}")
 
+        # Rewire MaxPoolGrad for Deeploy's recompute-from-input convention.
+        # ORT autodiff emits MaxPool with a 2nd "Indices/mask" output and wires
+        # MaxPoolGrad(dY, Indices). Deeploy's PULP MaxPoolGrad kernel instead
+        # recomputes the argmax from the forward input X (no index storage), so
+        # it expects MaxPoolGrad(dY, X). Applied only to network.onnx (Deeploy's
+        # input); network_train.onnx keeps the ORT convention so the ORT-based
+        # reference loss/grad computation still runs (identical math, same values).
+        self._rewire_maxpoolgrad_recompute(self.paths["network"])
+
         # Build the SGD optimizer ONNX graph (reads network.onnx to detect trainable params)
         self.create_optimizer()
 
@@ -673,6 +682,51 @@ class BaseONNXExporter(ABC):
         print(f"{'='*60}\n")
 
         return self.paths["network"]
+
+    def _rewire_maxpoolgrad_recompute(self, model_path: str) -> None:
+        """Rewire MaxPoolGrad to Deeploy's recompute-from-input convention.
+
+        ORT autodiff produces ``MaxPool -> [Y, Indices]`` and ``MaxPoolGrad(dY,
+        Indices)``. Deeploy's PULP ``MaxPoolGrad`` kernel recomputes the argmax
+        from the forward input X, so it expects ``MaxPoolGrad(dY, X)`` and the
+        forward MaxPool to be single-output. For every MaxPoolGrad whose 2nd
+        input is a MaxPool mask output, swap that input for the MaxPool's forward
+        input and drop the orphaned mask output. No-op for graphs without MaxPool.
+        """
+        import onnx
+
+        model = onnx.load(model_path)
+        graph = model.graph
+
+        # mask tensor name -> forward input (MaxPool.input[0])
+        mask_to_input = {
+            node.output[1]: node.input[0]
+            for node in graph.node
+            if node.op_type == "MaxPool" and len(node.output) >= 2
+        }
+        if not mask_to_input:
+            return
+
+        rewired = 0
+        for node in graph.node:
+            if node.op_type == "MaxPoolGrad" and len(node.input) >= 2:
+                if node.input[1] in mask_to_input:
+                    node.input[1] = mask_to_input[node.input[1]]
+                    rewired += 1
+
+        # Drop the now-orphaned mask (2nd) output from every MaxPool node.
+        for node in graph.node:
+            if node.op_type == "MaxPool" and len(node.output) >= 2:
+                del node.output[1:]
+
+        masks = set(mask_to_input)
+        keep_vi = [vi for vi in graph.value_info if vi.name not in masks]
+        del graph.value_info[:]
+        graph.value_info.extend(keep_vi)
+
+        onnx.save(model, model_path)
+        print(f"   Rewired {rewired} MaxPoolGrad node(s) to recompute from forward "
+              f"input; dropped {len(masks)} MaxPool mask output(s)")
 
     # ---------------------------------------------------------------------- #
     # Training test-data helpers                                             #

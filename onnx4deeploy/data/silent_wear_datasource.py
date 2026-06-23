@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 ETH Zurich and University of Bologna
+#
+# SPDX-License-Identifier: MIT
+
 """
 SilentWear DataSource — loads real EMG windows from the SilentWear dataset.
 
@@ -31,10 +35,20 @@ from .base_datasource import DataSource
 # The 14 differential EMG channels used by SpeechNet.
 # Ch_11 and Ch_12 are absent from the dataset — the hardware skips them.
 EMG_FILT_COLS = [
-    "Ch_0_filt",  "Ch_1_filt",  "Ch_2_filt",  "Ch_5_filt",
-    "Ch_3_filt",  "Ch_4_filt",  "Ch_7_filt",  "Ch_6_filt",
-    "Ch_8_filt",  "Ch_15_filt", "Ch_9_filt",  "Ch_14_filt",
-    "Ch_10_filt", "Ch_13_filt",
+    "Ch_0_filt",
+    "Ch_1_filt",
+    "Ch_2_filt",
+    "Ch_5_filt",
+    "Ch_3_filt",
+    "Ch_4_filt",
+    "Ch_7_filt",
+    "Ch_6_filt",
+    "Ch_8_filt",
+    "Ch_15_filt",
+    "Ch_9_filt",
+    "Ch_14_filt",
+    "Ch_10_filt",
+    "Ch_13_filt",
 ]  # 14 channels, hardware order [0,1,2,5,3,4,7,6,8,15,9,14,10,13]
 
 
@@ -133,11 +147,11 @@ class SilentWearDataSource(DataSource):
 
         # seg_starts[i] and seg_ends[i] define the i-th segment's time range.
         seg_starts = np.concatenate([[0], change_idx])
-        seg_ends   = np.concatenate([change_idx, [len(label_col)]])
+        seg_ends = np.concatenate([change_idx, [len(label_col)]])
 
         for start, end in zip(seg_starts, seg_ends):
-            seg = emg[start:end]       # (seg_len, 14) — one word/rest segment
-            lbl = label_col[start]     # scalar label for this segment
+            seg = emg[start:end]  # (seg_len, 14) — one word/rest segment
+            lbl = label_col[start]  # scalar label for this segment
 
             # Skip segments shorter than the required window.
             # This can happen for very short rest periods at recording edges.
@@ -154,7 +168,7 @@ class SilentWearDataSource(DataSource):
 
             if self.normalize:
                 mean = window.mean()
-                std  = window.std()
+                std = window.std()
                 window = (window - mean) / (std + 1e-8)
 
             # Reshape to SpeechNet input format: (batch, in_channels, height, width)
@@ -166,29 +180,36 @@ class SilentWearDataSource(DataSource):
             inputs.append(window)
             labels.append(np.array([int(lbl)], dtype=np.int64))  # shape (1,)
 
-        print(f"   Extracted {len(inputs)} windows "
-              f"(subject={self.subject}, session={self.session}, "
-              f"batch={self.batch}, condition={self.condition}, "
-              f"window={self.window_samples} samples)")
+        print(
+            f"   Extracted {len(inputs)} windows "
+            f"(subject={self.subject}, session={self.session}, "
+            f"batch={self.batch}, condition={self.condition}, "
+            f"window={self.window_samples} samples)"
+        )
 
         if self.downsample_rest and len(inputs) > 0:
             from collections import Counter
-            label_ints = [int(l[0]) for l in labels]
+
+            label_ints = [int(lbl[0]) for lbl in labels]
             counts = Counter(label_ints)
             cmd_counts = [v for k, v in counts.items() if k != 0]
             if cmd_counts:
                 min_cmd = min(cmd_counts)
                 rest_idx = [i for i, lbl in enumerate(label_ints) if lbl == 0]
                 if len(rest_idx) > min_cmd:
-                    keep_rest = np.random.RandomState(42).choice(
-                        rest_idx, size=min_cmd, replace=False
-                    ).tolist()
+                    keep_rest = (
+                        np.random.RandomState(42)
+                        .choice(rest_idx, size=min_cmd, replace=False)
+                        .tolist()
+                    )
                     non_rest_idx = [i for i, lbl in enumerate(label_ints) if lbl != 0]
                     keep = sorted(non_rest_idx + keep_rest)
                     inputs = [inputs[i] for i in keep]
                     labels = [labels[i] for i in keep]
-                    print(f"   Rest downsampled: {len(rest_idx)} → {min_cmd} "
-                          f"(matches min command class count)")
+                    print(
+                        f"   Rest downsampled: {len(rest_idx)} → {min_cmd} "
+                        f"(matches min command class count)"
+                    )
 
         # Cache for reuse
         self._inputs = inputs
@@ -249,6 +270,7 @@ class SilentWearDataSource(DataSource):
             # Group window indices by class, then sample n_batches // n_classes
             # from each class so every class is equally represented.
             from collections import defaultdict
+
             class_to_idx = defaultdict(list)
             for i, lbl in enumerate(labels):
                 class_to_idx[int(lbl[0])].append(i)
@@ -268,7 +290,9 @@ class SilentWearDataSource(DataSource):
                 ).tolist()
                 selected.extend(chosen)
             rng.shuffle(selected)
-            print(f"   Stratified split: {n_per_class} samples/class × {n_classes} classes = {len(selected)} total")
+            print(
+                f"   Stratified split: {n_per_class} samples/class × {n_classes} classes = {len(selected)} total"
+            )
             idx = selected
         else:
             # Sample n_batches indices from the available windows.

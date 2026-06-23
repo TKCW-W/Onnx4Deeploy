@@ -50,17 +50,20 @@ class SpeechNetExporter(BaseONNXExporter):
             "n_batches": 4,
             "n_accum": 1,
             "data_size": None,
-            "pretrained_weights": None,       # path to .pt checkpoint
+            "pretrained_weights": None,  # path to .pt checkpoint
             "pretrained_key": "model_state_dict",  # key inside the checkpoint dict
-            "use_maxpool": False,             # True = MaxPool (paper), False = AvgPool (deployment)
-            "normalize_input": True,          # False = raw EMG (must match training preprocessing)
-            "bn_recalibrate": False,          # recompute BN stats for AvgPool when using MaxPool weights
-            "bn_calib_sessions": [1, 2],      # sessions used for BN recalibration (keep deploy sess held out)
-            "data_path":  "/app/SilentWear_data/data_raw_and_filt",
-            "subject":    "S01",
-            "session":    3,
-            "batch":      1,
-            "condition":  "vocalized",
+            "use_maxpool": False,  # True = MaxPool (paper), False = AvgPool (deployment)
+            "normalize_input": True,  # False = raw EMG (must match training preprocessing)
+            "bn_recalibrate": False,  # recompute BN stats for AvgPool when using MaxPool weights
+            "bn_calib_sessions": [
+                1,
+                2,
+            ],  # sessions used for BN recalibration (keep deploy sess held out)
+            "data_path": "/app/SilentWear_data/data_raw_and_filt",
+            "subject": "S01",
+            "session": 3,
+            "batch": 1,
+            "condition": "vocalized",
             "stratified_sampling": False,
         }
 
@@ -104,14 +107,18 @@ class SpeechNetExporter(BaseONNXExporter):
 
     def _recalibrate_batchnorm(self, model: torch.nn.Module) -> None:
         """Reset BN running stats and recompute them with forward passes on
-        calibration windows (cumulative average, no labels, no gradients)."""
+        calibration windows (cumulative average, no labels, no gradients).
+        """
         import torch.nn as nn
+
         from ..data.silent_wear_datasource import SilentWearDataSource
 
         cfg = self.config
         calib_sessions = cfg.get("bn_calib_sessions", [1, 2])
-        print(f"  BN recalibration on sessions {calib_sessions} "
-              f"(deployment session {cfg.get('session', 3)} stays zero-shot)...")
+        print(
+            f"  BN recalibration on sessions {calib_sessions} "
+            f"(deployment session {cfg.get('session', 3)} stays zero-shot)..."
+        )
 
         windows: List[np.ndarray] = []
         for sess in calib_sessions:
@@ -126,9 +133,12 @@ class SpeechNetExporter(BaseONNXExporter):
                     downsample_rest=True,
                     normalize=cfg.get("normalize_input", True),
                 )
-                h5 = (Path(cfg["data_path"]) / cfg.get("subject", "S01")
-                      / cfg.get("condition", "vocalized")
-                      / f"sess_{sess}_batch_{b}.h5")
+                h5 = (
+                    Path(cfg["data_path"])
+                    / cfg.get("subject", "S01")
+                    / cfg.get("condition", "vocalized")
+                    / f"sess_{sess}_batch_{b}.h5"
+                )
                 if not h5.exists():
                     continue
                 xs, _ = ds._load_windows()
@@ -205,7 +215,6 @@ class SpeechNetExporter(BaseONNXExporter):
             print(f"   Frozen: {frozen[:5]}{'...' if len(frozen) > 5 else ''}")
         return requires_grad
 
-
     # ------------------------------------------------------------------ #
     # Return the data source for training mini-batch generation          #
     # ------------------------------------------------------------------ #
@@ -213,6 +222,7 @@ class SpeechNetExporter(BaseONNXExporter):
         dataset = self.config.get("dataset", "random")
         if dataset == "silentwear":
             from ..data.silent_wear_datasource import SilentWearDataSource
+
             cfg = self.config
             return SilentWearDataSource(
                 data_path=cfg["data_path"],
@@ -226,8 +236,8 @@ class SpeechNetExporter(BaseONNXExporter):
                 normalize=cfg.get("normalize_input", True),
             )
         from ..data.random_datasource import RandomDataSource
-        return RandomDataSource()
 
+        return RandomDataSource()
 
     # ------------------------------------------------------------------ #
     # Inference test data                                                  #
@@ -279,23 +289,25 @@ class SpeechNetExporter(BaseONNXExporter):
             for x in inputs:
                 all_outputs.append(model(torch.from_numpy(x)).numpy())
 
-        all_inputs_np  = np.concatenate(inputs,      axis=0)  # (N, 1, 14, 700)
+        all_inputs_np = np.concatenate(inputs, axis=0)  # (N, 1, 14, 700)
         all_outputs_np = np.concatenate(all_outputs, axis=0)  # (N, 9)
-        labels_np      = np.concatenate(labels,      axis=0)  # (N,)
+        labels_np = np.concatenate(labels, axis=0)  # (N,)
 
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
-        np.savez(save_path / "inputs.npz",  input=all_inputs_np,  label=labels_np)
+        np.savez(save_path / "inputs.npz", input=all_inputs_np, label=labels_np)
         np.savez(save_path / "outputs.npz", output=all_outputs_np)
-        print(f"   Inputs: {all_inputs_np.shape}  Outputs: {all_outputs_np.shape}  ({len(inputs)} windows)")
-        preds      = np.argmax(np.concatenate(all_outputs, axis=0), axis=-1)
-        labels_arr = np.concatenate(labels, axis=0)
-        classes    = np.unique(labels_arr)
-        per_class_recall = np.array(
-            [np.mean(preds[labels_arr == c] == c) for c in classes]
+        print(
+            f"   Inputs: {all_inputs_np.shape}  Outputs: {all_outputs_np.shape}  ({len(inputs)} windows)"
         )
+        preds = np.argmax(np.concatenate(all_outputs, axis=0), axis=-1)
+        labels_arr = np.concatenate(labels, axis=0)
+        classes = np.unique(labels_arr)
+        per_class_recall = np.array([np.mean(preds[labels_arr == c] == c) for c in classes])
         balanced_acc = per_class_recall.mean()
-        print(f"   Balanced accuracy = {balanced_acc:.4f} ({balanced_acc * 100:.1f}%)  ({len(inputs)} windows)")
+        print(
+            f"   Balanced accuracy = {balanced_acc:.4f} ({balanced_acc * 100:.1f}%)  ({len(inputs)} windows)"
+        )
         for c, r in zip(classes, per_class_recall):
             print(f"     class {int(c)}: recall = {r:.3f}")
 
@@ -350,10 +362,11 @@ class SpeechNetExporter(BaseONNXExporter):
         #     for _ in range(effective_data_size)
         # ]
 
-        ### Use real data set from SilentWear for training data
+        # Use real data set from SilentWear for training data
         data_source = self.get_data_source()
-        test_inputs, labels_list = data_source.load_batches(effective_data_size, input_shape, num_classes, seed=42)
-
+        test_inputs, labels_list = data_source.load_batches(
+            effective_data_size, input_shape, num_classes, seed=42
+        )
 
         init_map: dict = self._load_init_map(self.paths["network_infer"])
 

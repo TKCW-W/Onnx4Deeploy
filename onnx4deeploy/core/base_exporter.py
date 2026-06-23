@@ -536,7 +536,7 @@ class BaseONNXExporter(ABC):
             if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
                 bn_stats[name] = {
                     "running_mean": module.running_mean.clone(),
-                    "running_var":  module.running_var.clone(),
+                    "running_var": module.running_var.clone(),
                 }
 
         model.train()  # training=TrainingMode.TRAINING export requires train() mode
@@ -558,15 +558,16 @@ class BaseONNXExporter(ABC):
         # the EMA-corrupted values produced by the tracing forward pass.
         if bn_stats:
             from onnx import numpy_helper
+
             init_index = {init.name: init for init in onnx_model.graph.initializer}
             for bn_name, stats in bn_stats.items():
-                for suffix, tensor in (("running_mean", stats["running_mean"]),
-                                       ("running_var",  stats["running_var"])):
+                for suffix, tensor in (
+                    ("running_mean", stats["running_mean"]),
+                    ("running_var", stats["running_var"]),
+                ):
                     key = f"{bn_name}.{suffix}"  # dots preserved — RenameNodesPass runs later
                     if key in init_index:
-                        init_index[key].CopyFrom(
-                            numpy_helper.from_array(tensor.numpy(), name=key)
-                        )
+                        init_index[key].CopyFrom(numpy_helper.from_array(tensor.numpy(), name=key))
 
         onnx.save(onnx_model, self.paths["network_infer"])
         print(f"✅ Inference ONNX saved: {self.paths['network_infer']}")
@@ -725,8 +726,10 @@ class BaseONNXExporter(ABC):
         graph.value_info.extend(keep_vi)
 
         onnx.save(model, model_path)
-        print(f"   Rewired {rewired} MaxPoolGrad node(s) to recompute from forward "
-              f"input; dropped {len(masks)} MaxPool mask output(s)")
+        print(
+            f"   Rewired {rewired} MaxPoolGrad node(s) to recompute from forward "
+            f"input; dropped {len(masks)} MaxPool mask output(s)"
+        )
 
     # ---------------------------------------------------------------------- #
     # Training test-data helpers                                             #

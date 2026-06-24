@@ -11,16 +11,17 @@ Based on the SpeechNet architecture from:
 
 Differences from the upstream SilentWear SpeechNet:
   - Input is 4-D (B, 1, C, T) directly; no unsqueeze in forward().
-  - MaxPool2d replaced by AvgPool2d for Deeploy tiling/gradient compatibility.
+  - MaxPool kept as in the paper (the (1,1) "no pooling" blocks are emitted as
+    nn.Identity so the ONNX graph carries no degenerate MaxPool/MaxPoolGrad nodes).
   - No Dropout (deployment / inference mode).
 
 Paper default configuration (5 blocks):
   Input:   (1, 1, 14, 700)   14 EMG channels, 700 samples (1.4 s @ 500 Hz)
-  Block 0: Conv2d(1, 8,  k=(1,4),  pad=(0,2))  -> BN -> ReLU -> AvgPool(1,8)
-  Block 1: Conv2d(8, 16, k=(1,16), pad=(0,8))  -> BN -> ReLU -> AvgPool(1,4)
-  Block 2: Conv2d(16,16, k=(1,8),  pad=(0,4))  -> BN -> ReLU -> AvgPool(1,4)
-  Block 3: Conv2d(16,32, k=(7,1),  pad=(0,0))  -> BN -> ReLU -> AvgPool(1,1)
-  Block 4: Conv2d(32,32, k=(7,1),  pad=(0,0))  -> BN -> ReLU -> AvgPool(1,1)
+  Block 0: Conv2d(1, 8,  k=(1,4),  pad=(0,2))  -> BN -> ReLU -> MaxPool(1,8)
+  Block 1: Conv2d(8, 16, k=(1,16), pad=(0,8))  -> BN -> ReLU -> MaxPool(1,4)
+  Block 2: Conv2d(16,16, k=(1,8),  pad=(0,4))  -> BN -> ReLU -> MaxPool(1,4)
+  Block 3: Conv2d(16,32, k=(7,1),  pad=(0,0))  -> BN -> ReLU -> Identity (no pool)
+  Block 4: Conv2d(32,32, k=(7,1),  pad=(0,0))  -> BN -> ReLU -> Identity (no pool)
   Global:  AdaptiveAvgPool2d(1,1) -> Flatten -> Linear(32, num_classes)
 """
 
@@ -54,13 +55,11 @@ class SpeechNetDeploy(nn.Module):
         time_steps: int = 700,
         num_classes: int = 9,
         blocks_config: Optional[List[Dict[str, Any]]] = None,
-        use_maxpool: bool = False,
     ):
         super().__init__()
         self.num_channels = num_channels
         self.time_steps = time_steps
         self.num_classes = num_classes
-        self.use_maxpool = use_maxpool
 
         if blocks_config is None:
             blocks_config = [
@@ -89,10 +88,8 @@ class SpeechNetDeploy(nn.Module):
             # of blocks.N.3 and the loaded state_dict are unchanged.
             if pool_c == 1 and pool_t == 1:
                 pool_layer: nn.Module = nn.Identity()
-            elif use_maxpool:
-                pool_layer = nn.MaxPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
             else:
-                pool_layer = nn.AvgPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
+                pool_layer = nn.MaxPool2d(kernel_size=(pool_c, pool_t), stride=(pool_c, pool_t))
 
             layers: List[nn.Module] = [
                 nn.Conv2d(

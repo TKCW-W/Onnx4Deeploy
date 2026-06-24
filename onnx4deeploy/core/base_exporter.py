@@ -666,7 +666,13 @@ class BaseONNXExporter(ABC):
         # it expects MaxPoolGrad(dY, X). Applied only to network.onnx (Deeploy's
         # input); network_train.onnx keeps the ORT convention so the ORT-based
         # reference loss/grad computation still runs (identical math, same values).
-        self._rewire_maxpoolgrad_recompute(self.paths["network"])
+        _cfg = getattr(self, "config", {})
+        if _cfg.get("maxpool_fuse_relu", False):
+            self._fuse_maxpoolgrad_relu(self.paths["network"])
+        elif _cfg.get("maxpool_checkpoint", False):
+            self._checkpoint_maxpoolgrad_recompute(self.paths["network"])
+        else:
+            self._rewire_maxpoolgrad_recompute(self.paths["network"])
 
         # Build the SGD optimizer ONNX graph (reads network.onnx to detect trainable params)
         self.create_optimizer()
@@ -729,6 +735,157 @@ class BaseONNXExporter(ABC):
         print(
             f"   Rewired {rewired} MaxPoolGrad node(s) to recompute from forward "
             f"input; dropped {len(masks)} MaxPool mask output(s)"
+        )
+
+    def _checkpoint_maxpoolgrad_recompute(self, model_path: str) -> None:
+        """Approach 3 (activation checkpointing): recompute X for MaxPoolGrad.
+
+        Like ``_rewire_maxpoolgrad_recompute``, but instead of pointing
+        MaxPoolGrad at the *forward* ReLU output X — which then must stay
+        resident from the forward pool all the way to the backward MaxPoolGrad —
+        insert a fresh ``Relu`` node that recomputes ``X' = ReLU(BN output)`` and
+        point MaxPoolGrad at ``X'``. The BN output is already kept live for
+        ``ReLUGrad``, so the *forward* ReLU output can now be freed right after
+        the forward pool. Numerically identical: the BN output is a stored
+        tensor, so ``X' == X`` bit-for-bit.
+
+        Falls back to the plain rewire for any MaxPool whose input is not
+        produced by a Relu (no cheap activation to recompute from).
+        """
+        import onnx
+        from onnx import helper
+
+        model = onnx.load(model_path)
+        graph = model.graph
+
+        mask_to_input = {
+            node.output[1]: node.input[0]
+            for node in graph.node
+            if node.op_type == "MaxPool" and len(node.output) >= 2
+        }
+        if not mask_to_input:
+            return
+
+        producer = {o: n for n in graph.node for o in n.output}
+        vi_map = {vi.name: vi for vi in graph.value_info}
+
+        relu_before = {}  # id(consumer MaxPoolGrad) -> new Relu node to insert before it
+        vi_to_add = []
+        checkpointed = 0
+        fallback = 0
+
+        for node in graph.node:
+            if node.op_type != "MaxPoolGrad" or len(node.input) < 2:
+                continue
+            if node.input[1] not in mask_to_input:
+                continue
+            relu_out = mask_to_input[node.input[1]]  # forward ReLU output (X)
+            prod = producer.get(relu_out)
+            if prod is not None and prod.op_type == "Relu" and len(prod.input) >= 1:
+                bn_out = prod.input[0]  # ReLU input = BN output (held for ReLUGrad)
+                ckpt_out = f"{relu_out}_ckpt"
+                relu_ckpt = helper.make_node(
+                    "Relu", inputs=[bn_out], outputs=[ckpt_out], name=f"{prod.name}_ckpt"
+                )
+                node.input[1] = ckpt_out
+                relu_before[id(node)] = relu_ckpt
+                checkpointed += 1
+                if relu_out in vi_map:  # carry the shape so Deeploy infers cleanly
+                    new_vi = onnx.ValueInfoProto()
+                    new_vi.CopyFrom(vi_map[relu_out])
+                    new_vi.name = ckpt_out
+                    vi_to_add.append(new_vi)
+            else:
+                node.input[1] = relu_out  # plain rewire fallback
+                fallback += 1
+
+        # Insert each recompute Relu immediately before its consuming MaxPoolGrad
+        # (the BN output is produced in the forward pass, so this is topologically valid).
+        ordered = []
+        for n in graph.node:
+            if id(n) in relu_before:
+                ordered.append(relu_before[id(n)])
+            ordered.append(n)
+        del graph.node[:]
+        graph.node.extend(ordered)
+
+        for node in graph.node:
+            if node.op_type == "MaxPool" and len(node.output) >= 2:
+                del node.output[1:]
+
+        masks = set(mask_to_input)
+        keep_vi = [vi for vi in graph.value_info if vi.name not in masks]
+        del graph.value_info[:]
+        graph.value_info.extend(keep_vi)
+        graph.value_info.extend(vi_to_add)
+
+        onnx.save(model, model_path)
+        print(
+            f"   Checkpoint-rewired {checkpointed} MaxPoolGrad node(s) "
+            f"(recompute X' = ReLU(BN output); forward X freed); "
+            f"{fallback} fell back to direct X; dropped {len(masks)} MaxPool mask output(s)"
+        )
+
+    def _fuse_maxpoolgrad_relu(self, model_path: str) -> None:
+        """Fuse ReLU into MaxPoolGrad: read the held BN output, apply ReLU inline.
+
+        Best of both: rewire each MaxPoolGrad's 2nd input from the forward ReLU
+        output X to the **BN output** (X = ReLU(BN output)), and set the
+        ``apply_relu=1`` attribute so Deeploy's kernel applies ReLU (max(0,.))
+        while recomputing the argmax. No new node is added (nothing for the
+        scheduler to hoist), `X'` is never materialised, and the BN output is
+        already kept resident for ReLUGrad — so the forward ReLU output X is the
+        *only* tensor freed (it's no longer read at backward). Numerically
+        identical: argmax over max(0, BN) == argmax over X, and dX is grad w.r.t. X.
+
+        Falls back to the plain rewire for any MaxPool whose input is not a Relu.
+        """
+        import onnx
+        from onnx import helper
+
+        model = onnx.load(model_path)
+        graph = model.graph
+
+        mask_to_input = {
+            node.output[1]: node.input[0]
+            for node in graph.node
+            if node.op_type == "MaxPool" and len(node.output) >= 2
+        }
+        if not mask_to_input:
+            return
+
+        producer = {o: n for n in graph.node for o in n.output}
+        fused = 0
+        fallback = 0
+        for node in graph.node:
+            if node.op_type != "MaxPoolGrad" or len(node.input) < 2:
+                continue
+            if node.input[1] not in mask_to_input:
+                continue
+            relu_out = mask_to_input[node.input[1]]  # forward ReLU output (X)
+            prod = producer.get(relu_out)
+            if prod is not None and prod.op_type == "Relu" and len(prod.input) >= 1:
+                node.input[1] = prod.input[0]  # BN output (held for ReLUGrad)
+                node.attribute.append(helper.make_attribute("apply_relu", 1))
+                fused += 1
+            else:
+                node.input[1] = relu_out  # plain rewire fallback
+                fallback += 1
+
+        for node in graph.node:
+            if node.op_type == "MaxPool" and len(node.output) >= 2:
+                del node.output[1:]
+
+        masks = set(mask_to_input)
+        keep_vi = [vi for vi in graph.value_info if vi.name not in masks]
+        del graph.value_info[:]
+        graph.value_info.extend(keep_vi)
+
+        onnx.save(model, model_path)
+        print(
+            f"   Fused ReLU into {fused} MaxPoolGrad node(s) "
+            f"(read BN output + apply_relu=1; forward X freed, no X' materialised); "
+            f"{fallback} fell back to direct X; dropped {len(masks)} MaxPool mask output(s)"
         )
 
     # ---------------------------------------------------------------------- #

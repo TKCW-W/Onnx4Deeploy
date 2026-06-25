@@ -85,6 +85,37 @@ class SpeechNetExporter(BaseONNXExporter):
             state_dict = ckpt[key] if (key and isinstance(ckpt, dict) and key in ckpt) else ckpt
             model.load_state_dict(state_dict, strict=True)
             print(f"  Loaded pretrained weights from {ckpt_path}")
+
+        # Fold BatchNorm into the preceding Conv when the feature extractor is frozen
+        # (last_layer strategy) or explicitly requested.  Deeploy's training BatchNorm
+        # kernel (BatchNormInternal) recomputes *batch* statistics; with on-device
+        # batch-size-1 fine-tuning this normalises each window by its own spatial stats,
+        # corrupting the features relative to inference (which uses running stats).
+        # Folding removes the BN op so the frozen features match inference exactly,
+        # which is mathematically identical in eval mode (zero-shot accuracy unchanged).
+        strategy = self.model_config.get("training_strategy", "full")
+        if self.model_config.get("fold_bn", False) or strategy == "last_layer":
+            self._fold_bn_into_conv(model)
+            print("  Folded BatchNorm → Conv (running-stat features; required for batch-1 on-device FT)")
+        return model
+
+    @staticmethod
+    def _fold_bn_into_conv(model: torch.nn.Module) -> torch.nn.Module:
+        """Fold each block's BatchNorm2d into its preceding Conv2d and replace the
+        BN with nn.Identity (exact for eval-mode BN; uses running_mean/running_var)."""
+        import torch.nn as nn
+
+        for blk in model.blocks:
+            conv, bn = blk[0], blk[1]
+            if not isinstance(bn, nn.BatchNorm2d):
+                continue
+            std = torch.sqrt(bn.running_var + bn.eps)
+            scale = bn.weight / std  # (C,)
+            conv.weight.data = conv.weight.data * scale.reshape(-1, 1, 1, 1)
+            if conv.bias is None:
+                conv.bias = nn.Parameter(torch.zeros(conv.weight.shape[0]))
+            conv.bias.data = (conv.bias.data - bn.running_mean) * scale + bn.bias
+            blk[1] = nn.Identity()
         return model
 
     # ------------------------------------------------------------------ #

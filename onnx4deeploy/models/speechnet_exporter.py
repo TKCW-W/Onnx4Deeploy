@@ -86,6 +86,7 @@ class SpeechNetExporter(BaseONNXExporter):
             model.load_state_dict(state_dict, strict=True)
             print(f"  Loaded pretrained weights from {ckpt_path}")
 
+        # QW: BN-fold fix for on-device head-only fine-tuning ----------------- QW
         # Fold BatchNorm into the preceding Conv when the feature extractor is frozen
         # (last_layer strategy) or explicitly requested.  Deeploy's training BatchNorm
         # kernel (BatchNormInternal) recomputes *batch* statistics; with on-device
@@ -97,10 +98,11 @@ class SpeechNetExporter(BaseONNXExporter):
         if self.model_config.get("fold_bn", False) or strategy == "last_layer":
             self._fold_bn_into_conv(model)
             print("  Folded BatchNorm → Conv (running-stat features; required for batch-1 on-device FT)")
+        # QW: end BN-fold fix --------------------------------------------------- QW
         return model
 
     @staticmethod
-    def _fold_bn_into_conv(model: torch.nn.Module) -> torch.nn.Module:
+    def _fold_bn_into_conv(model: torch.nn.Module) -> torch.nn.Module:  # QW: added by QW
         """Fold each block's BatchNorm2d into its preceding Conv2d and replace the
         BN with nn.Identity (exact for eval-mode BN; uses running_mean/running_var)."""
         import torch.nn as nn

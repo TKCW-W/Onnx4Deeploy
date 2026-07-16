@@ -143,26 +143,29 @@ class SilentWearDataSource(DataSource):
         # +1 shifts the index to the first sample of the new segment.
         change_idx = np.where(np.diff(label_col) != 0)[0] + 1
 
-        # seg_starts[i] and seg_ends[i] define the i-th segment's time range.
+        # seg_starts[i] is the first sample index (ONSET) of the i-th contiguous
+        # label run (one word repetition or one rest period).
         seg_starts = np.concatenate([[0], change_idx])
-        seg_ends = np.concatenate([change_idx, [len(label_col)]])
 
-        for start, end in zip(seg_starts, seg_ends):
-            seg = emg[start:end]  # (seg_len, 14) — one word/rest segment
-            lbl = label_col[start]  # scalar label for this segment
+        for start in seg_starts:
+            lbl = label_col[start]  # scalar label for this segment (its onset run)
 
-            # Skip segments shorter than the required window.
-            # This can happen for very short rest periods at recording edges.
-            if len(seg) < self.window_samples:
+            # Paper windowing (WINDOWING_SPEC.md): exactly ONE window per
+            # utterance, anchored at the segment ONSET, spanning window_samples.
+            # The window is cut from the onset even when the labeled run is
+            # shorter than window_samples (it then extends into the following
+            # samples) — this is how SpeechNet was trained. The only skip rule is
+            # dropping a window that would overrun the END of the recording.
+            #
+            # NOTE: we deliberately do NOT center the window inside the run.
+            # Center-anchoring shifts every window off the paper's onset anchor
+            # and measurably degrades zero-shot accuracy (S01 sess3 batch2:
+            # 68.3% centered vs the paper's 81.67% onset-anchored).
+            end = start + self.window_samples
+            if end > len(emg):
                 continue
 
-            # Extract a window from the CENTER of the segment.
-            # The center is preferred over the onset because:
-            # - Onset has reaction-time jitter (paper limitation §V)
-            # - Offset has trailing muscle relaxation
-            # - Center captures the steady-state articulation
-            offset = (len(seg) - self.window_samples) // 2
-            window = seg[offset : offset + self.window_samples]  # (window_samples, 14)
+            window = emg[start:end]  # (window_samples, 14) — onset-anchored
 
             # Reshape to SpeechNet input format: (batch, in_channels, height, width)
             # = (1, 1, 14, window_samples)

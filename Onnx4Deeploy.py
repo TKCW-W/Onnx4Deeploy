@@ -380,6 +380,8 @@ def generate_model(
     lora_r: Optional[int] = None,
     lora_alpha: Optional[int] = None,
     training_strategy: Optional[str] = None,
+    custom_trainable_params: Optional[List[str]] = None,
+    bn_frozen_stats: bool = False,
     pretrained_weights: Optional[str] = None,
     subject: Optional[str] = None,
     session: Optional[int] = None,
@@ -485,6 +487,10 @@ def generate_model(
             exporter._config_overrides["lora_alpha"] = lora_alpha
         if training_strategy is not None:
             exporter._config_overrides["training_strategy"] = training_strategy
+        if custom_trainable_params is not None:
+            exporter._config_overrides["custom_trainable_params"] = custom_trainable_params
+        if bn_frozen_stats:
+            exporter._config_overrides["bn_frozen_stats"] = True
         if pretrained_weights is not None:
             exporter._config_overrides["pretrained_weights"] = pretrained_weights
         if subject is not None:
@@ -779,6 +785,25 @@ Examples:
         "Use 'lora' together with --use-lora to fine-tune only the LoRA adapters.",
     )
     parser.add_argument(
+        "--custom-trainable-params",
+        type=str,
+        nargs="+",
+        default=None,
+        dest="custom_trainable_params",
+        metavar="PARAM",
+        help="(train mode, --training-strategy custom) Explicit list of trainable parameter names "
+        "(ONNX initializer names); everything else is frozen. E.g. SpeechNet last-block+fc: "
+        "blocks_4_0_weight blocks_4_0_bias blocks_4_1_weight blocks_4_1_bias fc_weight fc_bias.",
+    )
+    parser.add_argument(
+        "--bn-frozen-stats",
+        action="store_true",
+        dest="bn_frozen_stats",
+        help="(train mode) Export BatchNorm in eval mode (frozen running stats) instead of live "
+        "batch statistics. Required for batch-1 on-device FT of a trainable conv block where BN "
+        "cannot be folded; mirrors the device-side BN_FROZEN_STATS compile flag.",
+    )
+    parser.add_argument(
         "--use-lora",
         action="store_true",
         dest="use_lora",
@@ -921,6 +946,8 @@ Examples:
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             training_strategy=args.training_strategy,
+            custom_trainable_params=args.custom_trainable_params,
+            bn_frozen_stats=args.bn_frozen_stats,
             pretrained_weights=args.pretrained_weights,
             subject=args.subject,
             session=args.session,

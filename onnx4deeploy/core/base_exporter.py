@@ -371,6 +371,7 @@ class BaseONNXExporter(ABC):
         input_tensor: torch.Tensor,
         opset_version: int = 12,
         training_mode: bool = False,
+        bn_frozen_stats: bool = False,
     ) -> onnx.ModelProto:
         """
         Export PyTorch model to ONNX.
@@ -389,9 +390,15 @@ class BaseONNXExporter(ABC):
             ONNX model
         """
         f = io.BytesIO()
-        export_training = (
-            torch.onnx.TrainingMode.TRAINING if training_mode else torch.onnx.TrainingMode.EVAL
-        )
+        if training_mode and bn_frozen_stats:
+            # Frozen-stat BN: honour per-module train/eval state so BatchNorm (set to eval() by the
+            # caller) exports in inference mode (training_mode=0 -> normalises with frozen running
+            # stats), while trainable Conv/Linear stay in train mode for ORT's gradient builder.
+            export_training = torch.onnx.TrainingMode.PRESERVE
+        elif training_mode:
+            export_training = torch.onnx.TrainingMode.TRAINING
+        else:
+            export_training = torch.onnx.TrainingMode.EVAL
 
         # For opset ≥ 17, LayerNormalization is a standard ONNX op, so PyTorch exports it
         # with only 1 output (Y).  ORT's gradient builder needs O(1)=mean and O(2)=inv_std_var.
@@ -540,6 +547,20 @@ class BaseONNXExporter(ABC):
                 }
 
         model.train()  # training=TrainingMode.TRAINING export requires train() mode
+        # QW: frozen-stat BN for fine-tuning.  When bn_frozen_stats is set, keep every BatchNorm in
+        # eval mode so the exported graph (and thus the ORT reference) normalises with the frozen
+        # running stats instead of live batch statistics.  Required for batch-1 on-device FT of a
+        # *trainable* conv block (e.g. last-block+fc), where folding BN away is not possible and live
+        # batch-1 BN corrupts the features.  Mirrors the device-side BN_FROZEN_STATS flag (BatchNorm.c)
+        # so the host ORT reference and GVSoC agree.  Default off -> unchanged for folded/head-only.
+        bn_frozen_stats = self.config.get("bn_frozen_stats", False)
+        if bn_frozen_stats:
+            n_bn = 0
+            for module in model.modules():
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+                    n_bn += 1
+            print(f"  BN_FROZEN_STATS: {n_bn} BatchNorm layer(s) in eval mode (frozen running stats)")
         self._model = model
 
         input_shape = self.get_input_shape()
@@ -552,7 +573,9 @@ class BaseONNXExporter(ABC):
         # run before generate_artifacts.
         opset_version = max(self.config.get("opset_version", 13), 13)
         print(f"\n📤 Exporting to ONNX (opset {opset_version}, training mode)...")
-        onnx_model = self._export_to_onnx(model, input_tensor, opset_version, training_mode=True)
+        onnx_model = self._export_to_onnx(
+            model, input_tensor, opset_version, training_mode=True, bn_frozen_stats=bn_frozen_stats
+        )
 
         # Restore snapshotted BN running stats into the ONNX initializers, overwriting
         # the EMA-corrupted values produced by the tracing forward pass.

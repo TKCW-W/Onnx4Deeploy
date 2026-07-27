@@ -273,6 +273,63 @@ class SpeechNetExporter(BaseONNXExporter):
     # Training test data                                                   #
     # ------------------------------------------------------------------ #
 
+    def _frozen_pytorch_reference(
+        self, init_map, test_inputs, labels_list, n_steps, n_accum,
+        effective_data_size, learning_rate, grad_tensor_map,
+    ):
+        """exp1 / Option A — compute the training reference in PyTorch with FROZEN BN.
+
+        ORT's ``BatchNormInternal(training_mode=1)`` normalises with live per-batch statistics, but the
+        device trains with the FROZEN pretrained running stats (``BN_FROZEN_STATS``). Running the same
+        loop in PyTorch with ``model.eval()`` (frozen BN, γ/β still trainable) reproduces exactly what the
+        device computes, so the runner's bit-exact loss check becomes meaningful.
+
+        Mirrors the device loop EXACTLY: same window order (``mb % data_size``), SUM gradient accumulation
+        (plain ``SGD(lr)`` → ``w ← w − lr·Σ gradᵢ``), one optimiser step per ``n_accum`` mini-batches.
+        Returns ``(all_losses, updated_weights)`` — ``updated_weights`` is ``init_map`` with the trainable
+        tensors replaced by their post-training values (frozen tensors unchanged).
+        """
+        import torch
+
+        model = self.create_model()          # SpeechNetDeploy; BN NOT folded for the 'full' strategy
+        # Load the exact fixture initial weights (init_map) so the reference starts where the device does.
+        sd = model.state_dict()
+        for tname in list(sd.keys()):
+            oname = tname.replace(".", "_")
+            if oname in init_map:
+                sd[tname] = torch.from_numpy(np.asarray(init_map[oname])).float().reshape(sd[tname].shape)
+        model.load_state_dict(sd)
+        model.eval()                          # FROZEN BN: running stats used and NOT updated; dropout off
+
+        trainable = set(grad_tensor_map.keys())   # params that have a grad-accumulation buffer
+        for tname, p in model.named_parameters():
+            p.requires_grad_(tname.replace(".", "_") in trainable)
+        params = [p for _, p in model.named_parameters() if p.requires_grad]
+        opt = torch.optim.SGD(params, lr=learning_rate)   # no momentum / no weight-decay → matches device
+        crit = torch.nn.CrossEntropyLoss()                # mean; batch-1 ⇒ single-window loss
+
+        all_losses = []
+        for update_step in range(n_steps):
+            opt.zero_grad()
+            for accum_step in range(n_accum):
+                mb = update_step * n_accum + accum_step
+                x = torch.from_numpy(np.asarray(test_inputs[mb % effective_data_size])).float()
+                y = torch.from_numpy(
+                    np.atleast_1d(np.asarray(labels_list[mb % effective_data_size])).reshape(-1)
+                ).long()
+                loss = crit(model(x), y)
+                loss.backward()               # SUM-accumulate into .grad (no zero between accum steps)
+                all_losses.append(float(loss.detach().item()))
+            opt.step()                        # w ← w − lr · Σ gradᵢ
+
+        updated = {k: np.asarray(v).copy() for k, v in init_map.items()}
+        with torch.no_grad():
+            for tname, p in model.named_parameters():
+                oname = tname.replace(".", "_")
+                if oname in updated:
+                    updated[oname] = p.detach().cpu().numpy().reshape(updated[oname].shape)
+        return all_losses, updated
+
     def create_training_test_data(
         self, n_batches: int = None, num_data_inputs: int = 2, n_accum: int = None
     ) -> None:
@@ -351,45 +408,67 @@ class SpeechNetExporter(BaseONNXExporter):
         all_losses: list = []
         feed_mb0: dict = {}
 
-        for update_step in range(n_steps):
-            accumulated_grads = {
-                pname: np.zeros_like(current_weights[pname])
-                for pname in grad_tensor_map
-                if pname in current_weights
-            }
-
-            for accum_step in range(n_accum):
-                mb = update_step * n_accum + accum_step
-
-                feed = self._build_input_feed(
+        _bn_frozen = bool(self.config.get("bn_frozen_stats", False))
+        if _bn_frozen:
+            # exp1 / Option A — frozen-BN reference in PyTorch (model.eval()); mirrors the device loop
+            # exactly (window order, SUM accumulation, plain SGD). See experiments/exp1/PLAN.md.
+            all_losses, current_weights = self._frozen_pytorch_reference(
+                init_map, test_inputs, labels_list, n_steps, n_accum,
+                effective_data_size, learning_rate, grad_tensor_map,
+            )
+            feed_mb0 = {
+                k: (v.copy() if hasattr(v, "copy") else v)
+                for k, v in self._build_input_feed(
                     session,
-                    param_values=current_weights,
-                    test_input=test_inputs[mb % effective_data_size],
-                    labels=labels_list[mb % effective_data_size],
-                    lazy_reset_grad=(accum_step == 0),
-                )
+                    param_values={kk: vv.copy() for kk, vv in init_map.items()},
+                    test_input=test_inputs[0],
+                    labels=labels_list[0],
+                    lazy_reset_grad=True,
+                ).items()
+            }
+            print(f"   [exp1/Option A] frozen-BN PyTorch reference — {len(all_losses)} losses "
+                  f"(first 5: {[round(x, 5) for x in all_losses[:5]]})")
+        else:
+            for update_step in range(n_steps):
+                accumulated_grads = {
+                    pname: np.zeros_like(current_weights[pname])
+                    for pname in grad_tensor_map
+                    if pname in current_weights
+                }
 
-                if mb == 0:
-                    feed_mb0 = {k: v.copy() if hasattr(v, "copy") else v for k, v in feed.items()}
+                for accum_step in range(n_accum):
+                    mb = update_step * n_accum + accum_step
 
-                raw_outputs = session.run(None, feed)
-                outputs_raw = dict(zip(session_output_names, raw_outputs))
+                    feed = self._build_input_feed(
+                        session,
+                        param_values=current_weights,
+                        test_input=test_inputs[mb % effective_data_size],
+                        labels=labels_list[mb % effective_data_size],
+                        lazy_reset_grad=(accum_step == 0),
+                    )
 
-                for out_name, out_val in outputs_raw.items():
-                    if "loss" in out_name.lower() and "grad" not in out_name.lower():
-                        all_losses.append(float(np.array(out_val).flatten()[0]))
-                        break
+                    if mb == 0:
+                        feed_mb0 = {k: v.copy() if hasattr(v, "copy") else v for k, v in feed.items()}
 
-                for pname, grad_name in grad_tensor_map.items():
-                    if grad_name in outputs_raw and pname in accumulated_grads:
-                        accumulated_grads[pname] += outputs_raw[grad_name]
+                    raw_outputs = session.run(None, feed)
+                    outputs_raw = dict(zip(session_output_names, raw_outputs))
 
-            for pname, acc_grad in accumulated_grads.items():
-                current_weights[pname] -= learning_rate * acc_grad
+                    for out_name, out_val in outputs_raw.items():
+                        if "loss" in out_name.lower() and "grad" not in out_name.lower():
+                            all_losses.append(float(np.array(out_val).flatten()[0]))
+                            break
+
+                    for pname, grad_name in grad_tensor_map.items():
+                        if grad_name in outputs_raw and pname in accumulated_grads:
+                            accumulated_grads[pname] += outputs_raw[grad_name]
+
+                for pname, acc_grad in accumulated_grads.items():
+                    current_weights[pname] -= learning_rate * acc_grad
 
         outputs_dict: dict = {k: v for k, v in current_weights.items()}
         outputs_dict["loss"] = np.array(all_losses, dtype=np.float32)
-        print(f"   Reference losses: {all_losses}")
+        print(f"   Reference losses ({'frozen-PyTorch' if _bn_frozen else 'ORT'}): "
+              f"{[round(x, 5) for x in all_losses[:8]]}{'...' if len(all_losses) > 8 else ''}")
 
         final_model = onnx.load(self.paths["network"])
         final_input_names = [inp.name for inp in final_model.graph.input]

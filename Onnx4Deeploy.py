@@ -382,7 +382,6 @@ def generate_model(
     training_strategy: Optional[str] = None,
     custom_trainable_params: Optional[List[str]] = None,
     bn_frozen_stats: bool = False,
-    bn_decompose_frozen: bool = False,
     pretrained_weights: Optional[str] = None,
     subject: Optional[str] = None,
     session: Optional[int] = None,
@@ -492,8 +491,6 @@ def generate_model(
             exporter._config_overrides["custom_trainable_params"] = custom_trainable_params
         if bn_frozen_stats:
             exporter._config_overrides["bn_frozen_stats"] = True
-        if bn_decompose_frozen:
-            exporter._config_overrides["bn_decompose_frozen"] = True
         if pretrained_weights is not None:
             exporter._config_overrides["pretrained_weights"] = pretrained_weights
         if subject is not None:
@@ -807,16 +804,6 @@ Examples:
         "cannot be folded; mirrors the device-side BN_FROZEN_STATS compile flag.",
     )
     parser.add_argument(
-        "--bn-decompose-frozen",
-        action="store_true",
-        dest="bn_decompose_frozen",
-        help="(train mode) Option B: replace every BatchNorm with an explicit frozen-affine "
-        "decomposition y=(x-running_mean)*inv_std*gamma+beta (running stats as constants, gamma/beta "
-        "trainable) BEFORE ORT generate_artifacts, so ORT autodiffs frozen BN natively. The per-step "
-        "reference loss is then ORT-computed on the SAME graph the device runs (no PyTorch reference, "
-        "no BatchNormInternal). Supersedes --bn-frozen-stats when set.",
-    )
-    parser.add_argument(
         "--use-lora",
         action="store_true",
         dest="use_lora",
@@ -961,7 +948,6 @@ Examples:
             training_strategy=args.training_strategy,
             custom_trainable_params=args.custom_trainable_params,
             bn_frozen_stats=args.bn_frozen_stats,
-            bn_decompose_frozen=args.bn_decompose_frozen,
             pretrained_weights=args.pretrained_weights,
             subject=args.subject,
             session=args.session,

@@ -86,6 +86,66 @@ def _fold_conv_bn_inplace(model: "torch.nn.Module") -> int:
     return n_folded
 
 
+class FrozenAffineBN(torch.nn.Module):
+    """Explicit frozen-affine replacement for a BatchNorm module (Option B).
+
+    Computes ``y = (x - running_mean) * inv_std * gamma + beta`` with ``running_mean``,
+    ``running_var`` and ``eps`` held as CONSTANTS (frozen pretrained stats) and ``gamma``
+    (``weight``) / ``beta`` (``bias``) kept as trainable Parameters.  Using plain tensor
+    ops means ``torch.onnx.export`` emits ``Sub / Mul / Add`` (no ``BatchNormalization``
+    node), so ORT's ``generate_artifacts`` autodiffs the frozen affine natively — the
+    gradient it builds (``dX = gamma*inv_std*dY``, ``dgamma = Σ dY·x̂``, ``dbeta = Σ dY``)
+    is EXACTLY what the device's ``BN_FROZEN_STATS`` kernel computes.
+
+    γ/β keep the ``weight``/``bias`` attribute names so the exported ONNX initializer names
+    for the trainable params are unchanged (``blocks.k.1.weight`` …) and ``get_trainable_params``
+    keeps working with no changes.  The frozen stats are pre-baked into two constant buffers:
+
+    - ``neg_running_mean`` = ``−running_mean``   (so the graph uses ``x + (−μ)`` → ``Add``, not ``Sub``)
+    - ``inv_running_std``  = ``1/√(running_var+eps)``  (so no ``Sqrt``/``Reciprocal`` op is emitted)
+
+    → the whole decomposition is ``Add`` / ``Mul`` only, all of which are bound in Deeploy's PULPOpen
+    target (``Sub``/``Sqrt``/``Reciprocal`` are NOT), so the SAME graph compiles on device.  Both buffer
+    names are matched by the ``_BN_BUFFERS`` frozen-param rule in ``export_training`` (they end with
+    ``running_mean`` / carry the ``inv_running_std`` suffix) → they land in ``frozen_params`` (no grad).
+    """
+
+    def __init__(self, bn: "torch.nn.Module"):
+        super().__init__()
+        self.num_features = int(bn.num_features)
+        self.register_buffer("neg_running_mean", -bn.running_mean.detach().clone())
+        self.register_buffer(
+            "inv_running_std", torch.rsqrt(bn.running_var.detach().clone() + float(bn.eps))
+        )
+        self.weight = torch.nn.Parameter(bn.weight.detach().clone())
+        self.bias = torch.nn.Parameter(bn.bias.detach().clone())
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        shape = [1, self.num_features] + [1] * (x.dim() - 2)  # broadcast over channel dim
+        neg_mean = self.neg_running_mean.view(shape)
+        inv_std = self.inv_running_std.view(shape)
+        gamma = self.weight.view(shape)
+        beta = self.bias.view(shape)
+        return (x + neg_mean) * inv_std * gamma + beta  # Add / Mul only (device-bound ops)
+
+
+def _swap_bn_to_frozen_affine(model: "torch.nn.Module") -> int:
+    """Replace every ``nn.BatchNorm*`` in ``model`` with :class:`FrozenAffineBN` in place.
+
+    Returns the number of layers swapped.  Must run BEFORE ``torch.onnx.export`` so the
+    decomposition (not a fused BN node) is what ORT sees.
+    """
+    import torch.nn as nn
+
+    n = 0
+    for parent in model.modules():
+        for name, child in list(parent.named_children()):
+            if isinstance(child, nn.modules.batchnorm._BatchNorm):
+                setattr(parent, name, FrozenAffineBN(child))
+                n += 1
+    return n
+
+
 class ExportMode(Enum):
     """Export mode: training, inference, or single-step training-as-inference."""
 
@@ -554,7 +614,17 @@ class BaseONNXExporter(ABC):
         # batch-1 BN corrupts the features.  Mirrors the device-side BN_FROZEN_STATS flag (BatchNorm.c)
         # so the host ORT reference and GVSoC agree.  Default off -> unchanged for folded/head-only.
         bn_frozen_stats = self.config.get("bn_frozen_stats", False)
-        if bn_frozen_stats:
+        # QW (Option B): decompose BN into an explicit frozen affine BEFORE export so ORT autodiffs
+        # frozen BN natively → the ORT reference loss runs on the SAME graph the device runs, with no
+        # BatchNormInternal and no PyTorch reference. Supersedes bn_frozen_stats (no eval()/PRESERVE
+        # needed: FrozenAffineBN already normalises with the frozen running stats).
+        bn_decompose_frozen = self.config.get("bn_decompose_frozen", False)
+        if bn_decompose_frozen:
+            n_bn = _swap_bn_to_frozen_affine(model)
+            bn_frozen_stats = False  # do not also take the eval()/PRESERVE path
+            print(f"  BN_DECOMPOSE_FROZEN: {n_bn} BatchNorm layer(s) → explicit frozen affine "
+                  f"(Sub/Mul/Add; γ/β trainable, running stats constant)")
+        elif bn_frozen_stats:
             n_bn = 0
             for module in model.modules():
                 if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
@@ -626,7 +696,11 @@ class BaseONNXExporter(ABC):
         # are non-differentiable buffers updated via EMA, not backprop.  They must go
         # into frozen_params (not requires_grad).  Omitting them from both lists causes
         # ORT to treat them as trainable by default → tries to build gradient nodes → crash.
-        _BN_BUFFERS = ("running_mean", "running_var", "num_batches_tracked")
+        # ``neg_running_mean`` / ``inv_running_std`` are the FrozenAffineBN (Option B) constant buffers.
+        _BN_BUFFERS = (
+            "running_mean", "running_var", "num_batches_tracked",
+            "neg_running_mean", "inv_running_std",
+        )
         all_initializer_names = [init.name for init in onnx_model.graph.initializer]
         bn_buffer_names = [
             n for n in all_initializer_names if any(n.endswith(s) for s in _BN_BUFFERS)

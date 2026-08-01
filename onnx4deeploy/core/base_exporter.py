@@ -722,15 +722,70 @@ class BaseONNXExporter(ABC):
         model = onnx.load(model_path)
         graph = model.graph
 
-        # mask tensor name -> forward input (MaxPool.input[0])
-        mask_to_input = {
-            node.output[1]: node.input[0]
+        # MaxPool nodes that carry a 2nd (mask/Indices) output.
+        mask_maxpools = {
+            node.output[1]: node
             for node in graph.node
             if node.op_type == "MaxPool" and len(node.output) >= 2
         }
-        if not mask_to_input:
+        if not mask_maxpools:
             return
 
+        # QW: Part-4 argmax-mask path (opt-in). Instead of recompute-from-X, insert a
+        # MaxPoolArgmax node emitting a uint8 within-window offset mask and feed THAT to
+        # MaxPoolGrad, keeping MaxPool single-output. Lets the forward activation be freed
+        # after the forward pass (only the small uint8 mask survives to backward). -- QW
+        if bool(self.config.get("maxpool_argmax_mask", False)):
+            from onnx import TensorProto, helper
+            vi_by_name = {vi.name: vi for vi in graph.value_info}
+            argmax_after = {}          # maxpool node name -> new MaxPoolArgmax node
+            old_to_new_mask = {}       # ORT mask name -> new argmax mask name
+            new_value_info = []
+            for mask_name, mp in mask_maxpools.items():
+                argmask_name = mp.output[0] + "_argmax_u8"
+                attrs = {a.name: helper.get_attribute_value(a)
+                         for a in mp.attribute if a.name in ("kernel_shape", "pads", "strides")}
+                argmax_after[mp.name] = helper.make_node(
+                    "MaxPoolArgmax", inputs=[mp.input[0]], outputs=[argmask_name],
+                    name=mp.name + "_argmax", **attrs)
+                old_to_new_mask[mask_name] = argmask_name
+                pooled_vi = vi_by_name.get(mp.output[0])
+                if pooled_vi is not None:
+                    shape = [d.dim_value for d in pooled_vi.type.tensor_type.shape.dim]
+                    new_value_info.append(
+                        helper.make_tensor_value_info(argmask_name, TensorProto.UINT8, shape))
+
+            rewired = 0
+            for node in graph.node:
+                if node.op_type == "MaxPoolGrad" and len(node.input) >= 2 \
+                        and node.input[1] in old_to_new_mask:
+                    node.input[1] = old_to_new_mask[node.input[1]]
+                    rewired += 1
+
+            # Rebuild node list: keep each MaxPool single-output and insert its argmax after it.
+            new_nodes = []
+            for node in graph.node:
+                if node.op_type == "MaxPool" and len(node.output) >= 2:
+                    del node.output[1:]
+                new_nodes.append(node)
+                if node.op_type == "MaxPool" and node.name in argmax_after:
+                    new_nodes.append(argmax_after[node.name])
+            del graph.node[:]
+            graph.node.extend(new_nodes)
+
+            old_masks = set(old_to_new_mask)
+            keep_vi = [vi for vi in graph.value_info if vi.name not in old_masks]
+            del graph.value_info[:]
+            graph.value_info.extend(keep_vi)
+            graph.value_info.extend(new_value_info)
+
+            onnx.save(model, model_path)
+            print(f"   QW: inserted {len(argmax_after)} MaxPoolArgmax node(s); "
+                  f"rewired {rewired} MaxPoolGrad to uint8 argmax mask")
+            return
+
+        # Default: recompute-from-input. Swap MaxPoolGrad's mask input for MaxPool.input[0].
+        mask_to_input = {name: mp.input[0] for name, mp in mask_maxpools.items()}
         rewired = 0
         for node in graph.node:
             if node.op_type == "MaxPoolGrad" and len(node.input) >= 2:

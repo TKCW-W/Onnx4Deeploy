@@ -382,6 +382,7 @@ def generate_model(
     training_strategy: Optional[str] = None,
     custom_trainable_params: Optional[List[str]] = None,
     bn_frozen_stats: bool = False,
+    maxpool_argmax_mask: bool = False,
     pretrained_weights: Optional[str] = None,
     subject: Optional[str] = None,
     session: Optional[int] = None,
@@ -491,6 +492,8 @@ def generate_model(
             exporter._config_overrides["custom_trainable_params"] = custom_trainable_params
         if bn_frozen_stats:
             exporter._config_overrides["bn_frozen_stats"] = True
+        if maxpool_argmax_mask:
+            exporter._config_overrides["maxpool_argmax_mask"] = True
         if pretrained_weights is not None:
             exporter._config_overrides["pretrained_weights"] = pretrained_weights
         if subject is not None:
@@ -804,6 +807,14 @@ Examples:
         "cannot be folded; mirrors the device-side BN_FROZEN_STATS compile flag.",
     )
     parser.add_argument(
+        "--maxpool-argmax-mask",
+        action="store_true",
+        dest="maxpool_argmax_mask",
+        help="(train mode, exp3 Part-4) Insert a MaxPoolArgmax node emitting a uint8 within-window "
+        "offset mask and feed it to MaxPoolGrad (instead of recompute-from-input), so the forward "
+        "activation can be freed after the forward pass. Relieves L2 activation stash.",
+    )
+    parser.add_argument(
         "--use-lora",
         action="store_true",
         dest="use_lora",
@@ -948,6 +959,7 @@ Examples:
             training_strategy=args.training_strategy,
             custom_trainable_params=args.custom_trainable_params,
             bn_frozen_stats=args.bn_frozen_stats,
+            maxpool_argmax_mask=args.maxpool_argmax_mask,
             pretrained_weights=args.pretrained_weights,
             subject=args.subject,
             session=args.session,

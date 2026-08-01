@@ -744,7 +744,9 @@ class BaseONNXExporter(ABC):
             for mask_name, mp in mask_maxpools.items():
                 argmask_name = mp.output[0] + "_argmax_u8"
                 attrs = {a.name: helper.get_attribute_value(a)
-                         for a in mp.attribute if a.name in ("kernel_shape", "pads", "strides")}
+                         for a in mp.attribute
+                         if a.name in ("kernel_shape", "pads", "strides", "ceil_mode")}
+                attrs.setdefault("ceil_mode", 0)  # QW: MaxPoolParser requires ceil_mode -- QW
                 argmax_after[mp.name] = helper.make_node(
                     "MaxPoolArgmax", inputs=[mp.input[0]], outputs=[argmask_name],
                     name=mp.name + "_argmax", **attrs)

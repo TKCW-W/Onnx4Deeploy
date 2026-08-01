@@ -753,13 +753,14 @@ class BaseONNXExporter(ABC):
                 if pooled_vi is not None:
                     shape = [d.dim_value for d in pooled_vi.type.tensor_type.shape.dim]
                     new_value_info.append(
-                        helper.make_tensor_value_info(argmask_name, TensorProto.UINT8, shape))
+                        helper.make_tensor_value_info(argmask_name, TensorProto.FLOAT, shape))
 
             rewired = 0
             for node in graph.node:
                 if node.op_type == "MaxPoolGrad" and len(node.input) >= 2 \
                         and node.input[1] in old_to_new_mask:
                     node.input[1] = old_to_new_mask[node.input[1]]
+                    node.op_type = "MaxPoolGradMask"   # QW: distinct mask-grad op -- QW
                     rewired += 1
 
             # Rebuild node list: keep each MaxPool single-output and insert its argmax after it.

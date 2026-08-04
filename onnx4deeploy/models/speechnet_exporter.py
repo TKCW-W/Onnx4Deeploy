@@ -58,6 +58,8 @@ class SpeechNetExporter(BaseONNXExporter):
             "batch": 1,
             "condition": "vocalized",
             "stratified_sampling": False,
+            # QW: zeroth-order (MeZO) config — perturbation scale + base seed for the ZO graphs. -- QW
+            "zo": {"epsilon": 0.01, "seed": 42, "exceptions": []},
         }
 
         if hasattr(self, "_config_overrides") and self._config_overrides:

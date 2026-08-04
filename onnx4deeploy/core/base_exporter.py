@@ -24,6 +24,8 @@ import onnx
 import torch
 
 from .onnx_utils import print_model_info
+# QW: ZO (MeZO) graph transforms — perturbed-forward+loss and in-place weight-update. -- QW
+from onnx4deeploy.transform.zo_transform import generate_weight_update_graph, generate_zo_graph
 
 # onnxruntime.training is only required by export_training (artifact generation).
 # Import lazily inside that method so single_step / inference / pytorch-only
@@ -97,6 +99,9 @@ class ExportMode(Enum):
     # outputs.npz holds the raw ORT-computed grad for every graph output, letting
     # `deeployRunner_*.py` (inference path) flag any per-tensor grad divergence.
     SINGLE_STEP = "train_single_step"
+    # QW: zeroth-order (MeZO) training export — perturbed-forward + loss graph
+    #     (network_zo_train) and an in-place weight-update graph (network_zo_update). -- QW
+    ZO_TRAINING = "zo-train"
 
 
 class BaseONNXExporter(ABC):
@@ -351,6 +356,16 @@ class BaseONNXExporter(ABC):
                 }
             )
 
+        # QW: ZO (MeZO) training paths — shared inference base + the two ZO graphs. -- QW
+        if mode == ExportMode.ZO_TRAINING:
+            paths.update(
+                {
+                    "network_infer": os.path.join(output_dir, "network_infer.onnx"),
+                    "network_zo_train": os.path.join(output_dir, "network_zo_train.onnx"),
+                    "network_zo_update": os.path.join(output_dir, "network_zo_update.onnx"),
+                }
+            )
+
         return paths
 
     def _get_config_string(self) -> str:
@@ -510,6 +525,185 @@ class BaseONNXExporter(ABC):
         print(f"{'='*60}\n")
 
         return self.paths["network"]
+
+    def export_zo_training(
+        self, save_path: Optional[str] = None, noise_type: str = "rademacher", quant: bool = False
+    ) -> str:
+        """
+        QW: Export model in zeroth-order (MeZO) training mode. -- QW
+
+        Produces:
+          network_infer.onnx      : plain forward graph (pretrained weights, BN unfolded + frozen stats
+                                    for the full-model frozen-BN recipe — do NOT fold BN, so BN γ/β survive).
+          network_zo_train.onnx   : perturbed-forward + SoftmaxCrossEntropyLoss (the ±ε loss-eval graph).
+          network_zo_update.onnx  : per-weight in-place perturbation (the update step).
+          inputs.npz / outputs.npz: real SilentWear data + reference loss (via create_training_test_data_zo).
+
+        The forward graph reuses the inference-export path so pretrained weights and BN-frozen handling are
+        identical to `export_inference`. The ZO graph augmentation is done by `zo_transform`.
+        """
+        if save_path:
+            self.save_path = save_path
+
+        self.config = self.load_config()
+        self.paths = self.setup_paths(ExportMode.ZO_TRAINING)
+
+        print(f"\n{'='*60}")
+        print(f"🚀 Exporting {self.get_model_name()} to ONNX (Zeroth-Order Training Mode)")
+        print(f"{'='*60}\n")
+
+        # 1. Build the forward graph -> network_infer.onnx.
+        #    CRITICAL: export in TRAINING mode with BN frozen so BatchNorm stays UNFOLDED (a separate
+        #    BatchNormalization node with its own γ/β initializers) instead of being folded into Conv.
+        #    Only then can ZO perturb/train BN γ/β while normalising with the frozen running stats.
+        #    Mirrors export_training's frozen-BN export path. -- QW
+        print("📦 Creating PyTorch model...")
+        model = self.create_model()
+
+        # snapshot BN running stats (the tracing forward can EMA-corrupt them)
+        bn_stats = {}
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                bn_stats[name] = {"running_mean": module.running_mean.clone(),
+                                  "running_var": module.running_var.clone()}
+
+        model.train()  # TrainingMode export requires train() — keeps ops (incl. BN) unfolded
+        bn_frozen_stats = self.config.get("bn_frozen_stats", True)  # ZO recipe: frozen stats, γ/β trainable
+        if bn_frozen_stats:
+            n_bn = 0
+            for module in model.modules():
+                if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                    module.eval(); n_bn += 1
+            print(f"  BN_FROZEN_STATS: {n_bn} BatchNorm layer(s) eval (frozen stats, γ/β still trainable)")
+
+        input_shape = self.get_input_shape()
+        input_tensor = torch.randn(*input_shape, dtype=torch.float32)
+        print(f"   Input shape: {input_shape}")
+        opset_version = max(self.config.get("opset_version", 13), 13)
+        onnx_model = self._export_to_onnx(
+            model, input_tensor, opset_version, training_mode=True, bn_frozen_stats=bn_frozen_stats
+        )
+
+        # restore snapshotted BN running stats into the ONNX initializers
+        if bn_stats:
+            from onnx import numpy_helper
+            init_index = {init.name: init for init in onnx_model.graph.initializer}
+            for bn_name, stats in bn_stats.items():
+                for suffix, tensor in (("running_mean", stats["running_mean"]),
+                                       ("running_var", stats["running_var"])):
+                    key = f"{bn_name}.{suffix}"
+                    if key in init_index:
+                        init_index[key].CopyFrom(numpy_helper.from_array(tensor.numpy(), name=key))
+
+        onnx.save(onnx_model, self.paths["network_infer"])
+        print(f"✅ Forward ONNX saved: {self.paths['network_infer']}")
+
+        print("\n🔧 Running inference optimizations...")
+        self._for_training = True
+        try:
+            self.run_inference_optimization(self.paths["network_infer"], self.paths["network_infer"])
+        finally:
+            self._for_training = False
+        from ..optimization.shape_optimizer import infer_shapes_with_custom_ops
+        infer_shapes_with_custom_ops(self.paths["network_infer"], self.paths["network_infer"])
+
+        # 2. Trainable params (informational; the ZO transform selects by op-type + name).
+        onnx_model = onnx.load(self.paths["network_infer"])
+        all_param_names = [init.name for init in onnx_model.graph.initializer]
+        requires_grad = self.get_trainable_params(all_param_names)
+        frozen_params = [n for n in all_param_names if n not in requires_grad]
+        print(f"\n🔹 Trainable parameters: {len(requires_grad)}  🔹 Frozen: {len(frozen_params)}")
+
+        # 3. ZO graph augmentation.
+        print(f"\n🔧 Generating ZO graphs (noise: {noise_type})...")
+        generate_zo_graph(
+            inference_onnx=self.paths["network_infer"],
+            output_onnx=self.paths["network_zo_train"],
+            zo_config=self.config["zo"],
+            noise_type=noise_type,
+            scales_path=self.config.get("scales_path", None),
+        )
+        generate_weight_update_graph(
+            onnx_path=self.paths["network_infer"],
+            output_path=self.paths["network_zo_update"],
+            zo_config=self.config["zo"],
+            noise_type=noise_type,
+            scales_path=self.config.get("scales_path", None),
+        )
+
+        # 4. Shape inference on the ZO forward graph (handles the mezo Perturb ops).
+        print("\n🔍 Running shape inference on ZO graph...")
+        infer_shapes_with_custom_ops(self.paths["network_zo_train"])
+
+        # 5. Fixtures (real data + reference loss).
+        print("\n🧪 Creating ZO test input/output...")
+        try:
+            self.create_training_test_data_zo()
+        except Exception as e:
+            print(f"⚠️  create_training_test_data_zo failed (graph still produced): {e}")
+
+        print(f"\n{'='*60}")
+        print("✅ ZO Export Complete!")
+        print(f"   zo_train : {self.paths['network_zo_train']}")
+        print(f"   zo_update: {self.paths['network_zo_update']}")
+        print(f"{'='*60}\n")
+        return self.paths["network_zo_train"]
+
+    def create_training_test_data_zo(self) -> None:
+        """
+        QW: ZO analogue of `create_training_test_data`. -- QW
+
+        Mirrors the BP fixture generator but for the ZO graphs: feeds REAL data (SilentWear windows +
+        labels via `get_data_source`) and computes the reference through the pure-Python `run_onnx_graph`
+        executor (which runs the mezo Perturb ops + frozen-BN + SoftmaxCrossEntropyLoss) — no ORT/autodiff.
+
+        Saved:
+          inputs.npz  = input (N,1,C,T) + label (N,1)  — real SilentWear windows.
+          outputs.npz = perturbed-forward reference `output` (log_prob, N×classes; the device's
+                        log-softmax output) + `updated_<name>` for every trainable tensor (the weights
+                        after the in-place ZO update, from network_zo_update).
+        """
+        from pathlib import Path
+        import numpy as np
+        from ..utils.onnx_node_implementations import run_onnx_graph
+
+        input_shape = self.get_input_shape()
+        num_classes = self.config.get("num_classes", 2)
+        save_dir = Path(self.paths["output_dir"])
+
+        # Real data: request a stratified draw (needs >= num_classes windows). Fall back to num_classes.
+        n = self.config.get("data_size") or num_classes
+        n = max(int(n), num_classes)
+        data_source = self.get_data_source()
+        inputs_list, labels_list = data_source.load_batches(n, input_shape, num_classes, seed=42)
+        X = np.concatenate([np.asarray(a, np.float32) for a in inputs_list], axis=0)          # (N,1,C,T)
+        Y = np.concatenate([np.asarray(l).reshape(-1) for l in labels_list]).astype(np.int64).reshape(-1, 1)
+
+        # Reference perturbed-forward log_prob, computed batch-1 (exactly as the device runs each window).
+        log_probs = []
+        for i in range(X.shape[0]):
+            lp = run_onnx_graph(self.paths["network_zo_train"], {"input": X[i:i + 1], "label": Y[i:i + 1]})
+            log_probs.append(np.asarray(lp, np.float32))
+        log_prob = np.concatenate(log_probs, axis=0)                                          # (N, classes)
+        out = {"output": log_prob}
+
+        # Updated weights from the in-place weight-update graph: request each perturbed tensor by name
+        # (out-name == in-name, so `values[name]` holds the post-update value).
+        import onnx as _onnx
+        upd_g = _onnx.load(self.paths["network_zo_update"]).graph
+        upd_names = [nd.input[0] for nd in upd_g.node if "Perturb" in nd.op_type]
+        n_upd = 0
+        try:
+            updated = run_onnx_graph(self.paths["network_zo_update"], {}, output_names=upd_names)
+            out.update({f"updated_{nm}": np.asarray(v) for nm, v in zip(upd_names, updated)})
+            n_upd = len(upd_names)
+        except Exception as e:
+            print(f"   (weight-update reference skipped: {e})")
+
+        np.savez(save_dir / "inputs.npz", input=X, label=Y)
+        np.savez(save_dir / "outputs.npz", **out)
+        print(f"  ✅ ZO fixtures: inputs.npz (input {X.shape}, label {Y.shape}), "
+              f"outputs.npz (log_prob {log_prob.shape}, +{n_upd} updated weights)")
 
     def export_training(self, save_path: Optional[str] = None) -> str:
         """

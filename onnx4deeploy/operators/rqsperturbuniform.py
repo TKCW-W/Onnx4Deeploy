@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: 2025 ETH Zurich and University of Bologna
+#
+# SPDX-License-Identifier: MIT
+
+"""PerturbRademacher operator test implementation."""
+
+from typing import Any, Dict, Tuple
+
+import numpy as np
+import onnxruntime as ort
+from onnx import TensorProto, helper
+
+from .base_operator import BaseOperatorTest
+
+
+class RQSPerturbUniformOperatorTest(BaseOperatorTest):
+    """Test generator for ONNX PerturbUniform operator (custom/training op)."""
+
+    def __init__(self, config_path=None, save_path=None):
+        super().__init__(config_path, save_path)
+        self.input_shape = None
+        self.num_classes = None
+        self.batch_size = None
+
+    def get_operator_name(self) -> str:
+        return "PerturbUniform"
+
+    def load_config(self) -> Dict[str, Any]:
+        """Load PerturbUniform-specific configuration."""
+        config = super().load_config()
+
+        pn_config = config.get("perturbuniform", {})
+        self.input_shape = tuple(pn_config["input_shape"])
+        return config
+    
+    def generate_inputs(self) -> np.ndarray:
+        """Generate input with both positive and negative values."""
+        x = np.random.randn(*self.input_shape).astype(np.float32)
+        # quantize:
+        max_val = np.max(np.abs(x), axis=1)
+        s = max_val / 127.0
+        s[s == 0] = 1.0 # Avoid division by zero
+        mul = np.round(0.01*np.sqrt(3) / s * (2**15)).astype(np.int32)  # quantized multiplier for perturbation
+        x_quantized = np.round(x / s[:, np.newaxis])
+        return {"x": x_quantized.astype(np.int32), "mul": mul.astype(np.int32)}
+    
+    def create_onnx_graph(self, inputs: Dict[str, np.ndarray]):
+        """Create ONNX graph for PerturbUniform operator."""
+        # Input tensors (without loss_grad for the final model)
+        x_tensor = helper.make_tensor_value_info(
+            "x", TensorProto.FLOAT, self.input_shape
+        )
+        mul_initializer = helper.make_tensor(
+            name="mul",
+            data_type=TensorProto.FLOAT,
+            dims=[self.input_shape[0]],
+            vals=inputs["mul"],
+        )
+        # Output tensor
+        perturbed_x_tensor = helper.make_tensor_value_info(
+            "perturbed_x", TensorProto.FLOAT, self.input_shape
+        )
+
+        # PerturbUniform node (without loss_grad input)
+        perturb_node = helper.make_node(
+            "RQSPerturbUniform",
+            inputs=["x", "mul"],
+            outputs=["perturbed_x"],
+            seed=42,
+            idx=0,
+            div=2**15,
+            n_levels=256,
+            signed=1,
+            name="rqs_perturb_uniform_node",
+            domain="com.microsoft"
+        )
+
+        # Graph
+        graph = helper.make_graph(
+            [perturb_node],
+            "perturb_uniform_graph",
+            [x_tensor],
+            [perturbed_x_tensor],
+            [mul_initializer]
+        )
+
+        return graph
+
+    def create_model(self, graph, opset_version: int = 13):
+        """Create ONNX model for PerturbUniform with custom domain."""
+        model = helper.make_model(
+            graph,
+            producer_name=f"{self.get_operator_name().lower()}_test",
+            opset_imports=[
+                helper.make_opsetid("", opset_version),
+                helper.make_opsetid("com.microsoft", 1),
+            ],
+        )
+
+        return model
+
+    def run_inference(self, onnx_file: str, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Run inference using custom emulation
+        """
+        # perturbation is built from -1's and 1's
+        perturbation = np.random.randint(-1, 2, size=self.input_shape).astype(np.int8)
+        perturbation = perturbation * inputs["mul"].reshape(-1, 1) // 2 ** 15
+        perturbed_x = inputs["x"] + perturbation
+        
+        return {"perturbed_x": perturbed_x}
+
+    def compute_expected_output(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Return None to skip validation - this is a custom operator.
+        """
+        return None

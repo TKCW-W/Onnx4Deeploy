@@ -389,6 +389,7 @@ def generate_model(
     batch: Optional[int] = None,
     condition: Optional[str] = None,
     stratified_sampling: bool = False,
+    noise_type: str = "rademacher",  # QW: ZO perturbation distribution -- QW
 ):
     """Generate model ONNX"""
     print(f"\n{'='*70}")
@@ -525,6 +526,9 @@ def generate_model(
         elif mode == "quant":
             onnx_file = exporter.export_quantized()
             mode_desc = "Quantized (QCDQ) mode"
+        elif mode == "zo-train":  # QW: zeroth-order (MeZO) training export -- QW
+            onnx_file = exporter.export_zo_training(noise_type=noise_type)
+            mode_desc = "Zeroth-order (MeZO) training mode"
         else:
             print(f"❌ Unknown mode: {mode}")
             print("   Available modes: infer, train, train_single_step, quant")
@@ -650,13 +654,23 @@ Examples:
         "-mode",
         "--mode",
         type=str,
-        choices=["infer", "train", "train_single_step", "quant"],
+        choices=["infer", "train", "train_single_step", "quant", "zo-train"],
         default="infer",
         help="Model export mode: infer (FP32 inference), train (training), "
         "train_single_step (training graph wired up for inference-runner-style "
         "per-tensor gradient verification: lazy_reset_grad pinned True, "
         "outputs.npz holds raw ORT grads), or quant (Brevitas QCDQ ONNX via "
-        "DeepQuant — see docs/Quantization_Integration.md). [default: infer]",
+        "DeepQuant — see docs/Quantization_Integration.md), or zo-train "
+        "(zeroth-order MeZO training). [default: infer]",
+    )
+    # QW: ZO perturbation distribution (used by -mode zo-train). -- QW
+    parser.add_argument(
+        "--noise-type",
+        type=str,
+        default="rademacher",
+        choices=["gaussian", "uniform", "triangle", "rademacher", "eggroll",
+                 "rqs_rademacher", "rqs_uniform"],
+        help="ZO perturbation noise distribution [default: rademacher]",
     )
 
     # Output path
@@ -966,6 +980,7 @@ Examples:
             batch=args.batch,
             condition=args.condition,
             stratified_sampling=args.stratified_sampling,
+            noise_type=args.noise_type,  # QW: ZO -- QW
         )
 
 

@@ -86,9 +86,14 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
     new_initializers = list(initializers)  # Start with the original initializers and add new ones as needed
     nodes = []
     perturbation_counter = 0
+    # QW: canonical per-parameter node_id = position in the FULL initializer list — identical to the map
+    #     used by inject_perturbation_nodes (both read network_infer). Keying the update Perturb `idx` on
+    #     this makes z(update) == z(forward) per param, fixing the pre-existing MeZO idx mismatch. -- QW
+    canonical_id = {init.name: i for i, init in enumerate(model.graph.initializer)}
 
     for init in initializers:
         perturbed_name = init.name  # Overwrite the initializer directly
+        perturbation_counter = canonical_id[init.name]  # QW: consistent node_id (see above) -- QW
         if noise_type == "gaussian":
             node = helper.make_node(
                 "PerturbNormal",
@@ -395,6 +400,12 @@ def inject_perturbation_nodes(
         base_seed = int(seed)
         perturbation_counter = 0
         epsilon=0.01
+        # QW: canonical per-parameter node_id = the tensor's position in the initializer list. BOTH this
+        #     function (zo_train) and generate_weight_update_graph (zo_update) key the Perturb `idx` on
+        #     this SAME map (both read network_infer), so the forward-perturbation z and the update z
+        #     match per param. Fixes the pre-existing idx mismatch (train counter += 2, update += 1) that
+        #     made the on-device MeZO update step along a different direction than the ±ε probe. -- QW
+        canonical_id = {init.name: i for i, init in enumerate(original_model.graph.initializer)}
         # Prepare a fast lookup for initializer names
         initializer_names = {init.name for init in new_initializers}
         
@@ -422,6 +433,9 @@ def inject_perturbation_nodes(
                     
                     if input_name in initializer_names:
                         made_change = True
+                        # QW: use the canonical per-param node_id for the Perturb `idx` (and the perturbed
+                        #     edge name), so it is identical to the same param's idx in zo_update. -- QW
+                        perturbation_counter = canonical_id[input_name]
 
                         print(f"input_name {i}: {input_name}")
                         # Find the original weight tensor to get its properties

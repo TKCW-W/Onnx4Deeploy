@@ -510,3 +510,171 @@ class SpeechNetExporter(BaseONNXExporter):
         np.savez(save_dir / "outputs.npz", **outputs_dict)
         n_updated = sum(1 for k in outputs_dict if k in init_map)
         print(f"   outputs.npz: {len(outputs_dict)} tensors ({n_updated} updated params + loss)")
+
+    # ------------------------------------------------------------------ #
+    # QW: Zeroth-order (MeZO) multi-step training fixture                  #
+    # ------------------------------------------------------------------ #
+    def _zo_pytorch_reference(
+        self, init_map, test_inputs, labels_list, n_steps, n_accum,
+        effective_data_size, lr, eps, seed, q, node_id_map,
+    ):
+        """QW: ZO analogue of `_frozen_pytorch_reference` — the FULL N-step faithful MeZO run in PyTorch.
+
+        Mirrors the device ZO loop: FROZEN BN (``model.eval()``, γ/β still perturbed), one SHARED
+        perturbation direction ``z`` per update window (device Rademacher RNG ``_perturb_rademacher`` keyed
+        by the per-param ``node_id`` from the graph — now consistent between zo_train/zo_update), scalar
+        accumulation of ``(L₊ − L₋)`` over ``n_accum`` windows, and one in-place update
+        ``θ ← θ − lr·g_proj·z`` per window; ``q`` directions averaged. Per-window seed convention:
+        ``g = seed + update_step·q + q_i`` (the on-device runner must override the graph seed the same way).
+
+        Returns ``(all_log_prob, all_lplus, all_lminus, updated_weights)``.
+        """
+        import torch
+        from ..utils.onnx_node_implementations import _perturb_rademacher
+
+        model = self.create_model()
+        sd = model.state_dict()
+        for tname in list(sd.keys()):
+            oname = tname.replace(".", "_")
+            if oname in init_map:
+                sd[tname] = torch.from_numpy(np.asarray(init_map[oname])).float().reshape(sd[tname].shape)
+        model.load_state_dict(sd)
+        model.eval()                                  # FROZEN BN (running stats fixed; γ/β perturbed)
+
+        # Trainable = the perturb targets (from zo_train); attach each torch param + its node_id.
+        targets = []  # (oname, torch_param, node_id)
+        for tname, p in model.named_parameters():
+            oname = tname.replace(".", "_")
+            if oname in node_id_map and node_id_map[oname] is not None:
+                targets.append((oname, p, int(node_id_map[oname])))
+
+        crit = torch.nn.CrossEntropyLoss()
+
+        def z_for(param, gseed, node_id):
+            z = _perturb_rademacher(np.zeros(tuple(param.shape), np.float32), int(gseed), int(node_id), 1.0, 1)
+            return torch.from_numpy(np.ascontiguousarray(z)).reshape(param.shape)
+
+        def add_(zs, coeff):
+            if coeff == 0.0:
+                return
+            for (_, p, _), z in zip(targets, zs):
+                p.add_(z, alpha=float(coeff))
+
+        all_lp, all_lplus, all_lminus = [], [], []
+        with torch.no_grad():
+            for update_step in range(n_steps):
+                for q_i in range(q):
+                    gseed = int(seed) + update_step * q + q_i
+                    zs = [z_for(p, gseed, nid) for (_, p, nid) in targets]   # SHARED z across the window
+                    lp_sum = lm_sum = 0.0
+                    for accum_step in range(n_accum):
+                        mb = update_step * n_accum + accum_step
+                        x = torch.from_numpy(np.asarray(test_inputs[mb % effective_data_size])).float()
+                        y = torch.from_numpy(
+                            np.atleast_1d(np.asarray(labels_list[mb % effective_data_size])).reshape(-1)
+                        ).long()
+                        add_(zs, +eps)                                       # +ε
+                        logits_p = model(x)
+                        lp = torch.log_softmax(logits_p, dim=-1).cpu().numpy().astype(np.float32)
+                        Lp = float(crit(logits_p, y).item())
+                        add_(zs, -2.0 * eps)                                 # −ε
+                        Lm = float(crit(model(x), y).item())
+                        add_(zs, +eps)                                       # restore θ
+                        lp_sum += Lp; lm_sum += Lm
+                        all_lp.append(lp); all_lplus.append(Lp); all_lminus.append(Lm)
+                    g_proj = (lp_sum - lm_sum) / (2.0 * eps * n_accum)
+                    add_(zs, -lr * g_proj / q)                               # in-place update along z
+
+        updated = {k: np.asarray(v).copy() for k, v in init_map.items()}
+        for (oname, p, _) in targets:
+            updated[oname] = p.detach().cpu().numpy().reshape(updated[oname].shape)
+        return all_lp, all_lplus, all_lminus, updated
+
+    def create_training_test_data_zo(
+        self, n_batches: int = None, num_data_inputs: int = 2, n_accum: int = None
+    ) -> None:
+        """QW: ZO multi-step fixture — the ZO analogue of `create_training_test_data`.
+
+        Simulates the full MeZO run (via `_zo_pytorch_reference`) and packs the SAME format as the BP
+        fixture so the on-device ZO runner can validate per-step + final:
+          inputs.npz  : mb0 feed (arr_XXXX = window₀, label₀) + every other window/label (mb{mb}_arr_)
+                        + meta (data_size, n_batches, n_accum) + ZO meta (eps, seed, lr, q).
+          outputs.npz : final trained weights + per-step `log_prob` (device log-softmax output)
+                        + scalar `loss_plus` / `loss_minus` (for g_proj validation).
+        """
+        import numpy as np
+        import onnx
+
+        if n_batches is None:
+            n_batches = self.config.get("n_batches", 4)
+        if n_accum is None:
+            n_accum = int(self.config.get("n_accum", 1))
+        if n_batches % n_accum != 0:
+            n_batches = max((n_batches // n_accum) * n_accum, n_accum)
+        n_steps = n_batches // n_accum
+
+        save_dir = Path(self.paths["output_dir"])
+        save_dir.mkdir(parents=True, exist_ok=True)
+        input_shape = self.get_input_shape()
+        num_classes = self.config.get("num_classes", 9)
+        lr = float(self.config.get("learning_rate", 0.001))
+        zo = self.config.get("zo", {})
+        eps = float(zo.get("epsilon", 0.01)); seed = int(zo.get("seed", 42)); q = int(zo.get("q", 1))
+        _dc = self.config.get("data_size", None)
+        effective_data_size = int(_dc) if (_dc and int(_dc) < n_batches) else n_batches
+
+        print(f"   ZO training sim: n_batches={n_batches} n_accum={n_accum} n_steps={n_steps} "
+              f"q={q} lr={lr} eps={eps} seed={seed}")
+
+        data_source = self.get_data_source()
+        test_inputs, labels_list = data_source.load_batches(
+            effective_data_size, input_shape, num_classes, seed=42
+        )
+        init_map = self._load_init_map(self.paths["network_infer"])
+
+        # Per-param node_id from zo_train (== zo_update after the idx-consistency fix).
+        zt = onnx.load(self.paths["network_zo_train"]).graph
+        node_id_map = {
+            n.input[0]: next((a.i for a in n.attribute if a.name == "idx"), None)
+            for n in zt.node if "Perturb" in n.op_type
+        }
+
+        all_lp, all_lplus, all_lminus, updated = self._zo_pytorch_reference(
+            init_map, test_inputs, labels_list, n_steps, n_accum,
+            effective_data_size, lr, eps, seed, q, node_id_map,
+        )
+
+        # outputs.npz : final weights + per-step references.
+        outputs_dict = {k: v for k, v in updated.items()}
+        outputs_dict["log_prob"] = np.concatenate(all_lp, axis=0).astype(np.float32)
+        outputs_dict["loss_plus"] = np.array(all_lplus, dtype=np.float32)
+        outputs_dict["loss_minus"] = np.array(all_lminus, dtype=np.float32)
+        np.savez(save_dir / "outputs.npz", **outputs_dict)
+        n_upd = sum(1 for k in outputs_dict if k in init_map)
+        print(f"   outputs.npz: {n_upd} final weights + log_prob {outputs_dict['log_prob'].shape} "
+              f"+ loss_plus/minus ({len(all_lplus)} step-losses)")
+
+        # inputs.npz : BP-style packing (arr_ for mb0 + mb{mb}_arr_ for the rest + meta).
+        zt_input_names = [i.name for i in zt.input]        # ['input', 'label']
+        feed0 = {
+            "input": np.asarray(test_inputs[0], np.float32),
+            "label": np.atleast_1d(np.asarray(labels_list[0])).reshape(-1, 1).astype(np.int64),
+        }
+        save_dict = {}
+        for npz_idx, name in enumerate(zt_input_names):
+            if name in feed0:
+                save_dict[f"arr_{npz_idx:04d}"] = feed0[name]
+        for mb in range(1, effective_data_size):
+            save_dict[f"mb{mb}_arr_0000"] = np.asarray(test_inputs[mb], np.float32)
+            save_dict[f"mb{mb}_arr_0001"] = np.atleast_1d(
+                np.asarray(labels_list[mb])).reshape(-1, 1).astype(np.int64)
+        save_dict["meta_data_size"] = np.array([effective_data_size], np.int32)
+        save_dict["meta_n_batches"] = np.array([n_batches], np.int32)
+        save_dict["meta_n_accum"] = np.array([n_accum], np.int32)
+        save_dict["meta_zo_eps"] = np.array([eps], np.float32)
+        save_dict["meta_zo_seed"] = np.array([seed], np.int32)
+        save_dict["meta_zo_lr"] = np.array([lr], np.float32)
+        save_dict["meta_zo_q"] = np.array([q], np.int32)
+        np.savez(save_dir / "inputs.npz", **save_dict)
+        print(f"   inputs.npz: {len(zt_input_names)} base tensors + "
+              f"{(effective_data_size - 1) * num_data_inputs} DATA entries + meta")

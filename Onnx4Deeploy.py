@@ -432,7 +432,7 @@ def generate_model(
 
         # Resolve n_batches from whichever training-length parameter was given.
         # Priority: --n-batches > --n-steps > --n-epochs > default(4)
-        if mode in ("train", "train_single_step"):
+        if mode in ("train", "train_single_step", "zo-train"):  # QW: ZO fixture needs the step count too -- QW
             import math
 
             if n_batches is not None:
@@ -461,7 +461,7 @@ def generate_model(
         # inside export_training().  Exporters that support _config_overrides
         # will apply these at the end of their load_config() implementation.
         exporter._config_overrides = {}
-        if mode in ("train", "train_single_step"):
+        if mode in ("train", "train_single_step", "zo-train"):  # QW: thread step count into ZO fixture -- QW
             exporter._config_overrides["n_batches"] = n_batches
             exporter._config_overrides["n_accum"] = n_accum
             exporter._config_overrides["batch_size"] = batch_size

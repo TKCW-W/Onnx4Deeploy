@@ -883,13 +883,14 @@ class BaseONNXExporter(ABC):
         shutil.copy(self.paths["network_train_optim"], self.paths["network"])
         print(f"✅ Final model: {self.paths['network']}")
 
-        # Rewire MaxPoolGrad for Deeploy's recompute-from-input convention.
+        # QW: Rewire MaxPoolGrad for Deeploy's recompute-from-input convention.
         # ORT autodiff emits MaxPool with a 2nd "Indices/mask" output and wires
         # MaxPoolGrad(dY, Indices). Deeploy's PULP MaxPoolGrad kernel instead
         # recomputes the argmax from the forward input X (no index storage), so
         # it expects MaxPoolGrad(dY, X). Applied only to network.onnx (Deeploy's
         # input); network_train.onnx keeps the ORT convention so the ORT-based
         # reference loss/grad computation still runs (identical math, same values).
+        # Not in upstream Onnx4Deeploy — added for the SpeechNet on-device FT path. -- QW
         self._rewire_maxpoolgrad_recompute(self.paths["network"])
 
         # Build the SGD optimizer ONNX graph (reads network.onnx to detect trainable params)
@@ -909,7 +910,12 @@ class BaseONNXExporter(ABC):
         return self.paths["network"]
 
     def _rewire_maxpoolgrad_recompute(self, model_path: str) -> None:
-        """Rewire MaxPoolGrad to Deeploy's recompute-from-input convention.
+        """Rewire MaxPoolGrad to Deeploy's recompute-from-input convention. -- QW
+
+        QW: entire method is our addition (not in upstream Onnx4Deeploy). Two paths:
+        the DEFAULT recompute-from-X rewire (below), and the opt-in argmax-mask
+        rewrite gated on config["maxpool_argmax_mask"]. -- QW
+
 
         ORT autodiff produces ``MaxPool -> [Y, Indices]`` and ``MaxPoolGrad(dY,
         Indices)``. Deeploy's PULP ``MaxPoolGrad`` kernel recomputes the argmax
@@ -988,7 +994,8 @@ class BaseONNXExporter(ABC):
                   f"rewired {rewired} MaxPoolGrad to uint8 argmax mask")
             return
 
-        # Default: recompute-from-input. Swap MaxPoolGrad's mask input for MaxPool.input[0].
+        # QW: Default path — recompute-from-input. Swap MaxPoolGrad's mask input for
+        # MaxPool.input[0] (this is the behaviour used unless --maxpool-argmax-mask is set). -- QW
         mask_to_input = {name: mp.input[0] for name, mp in mask_maxpools.items()}
         rewired = 0
         for node in graph.node:

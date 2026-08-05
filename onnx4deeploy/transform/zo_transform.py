@@ -824,14 +824,16 @@ def inject_perturbation_nodes(
             value_info=new_value_info
         )
 
-        # QW: The zo_train (perturbed-forward) graph keeps the trainable weights as INITIALIZERS —
-        #     this is the reference ZO design (the demo ZO graph and every downstream fixture expect
-        #     the base weight of each Perturb node to be a constant initializer, not a runner-supplied
-        #     input). An earlier revision promoted them to graph inputs to mirror the BP training graph;
-        #     that forced a downstream re-bake back to initializers and mis-set the Perturb base, so it
-        #     is reverted here. Only the zo_update graph keeps weights-as-inputs (optimizer in/out
-        #     contract; see generate_weight_update_graph). -- QW
-        # _promote_initializers_to_inputs(new_graph, perturbed_original_names)  # -- QW (reverted, see above)
+        # QW: Promote the perturbed trainable weights to graph INPUTS (and drop them from
+        #     graph.initializer), so the exported zo_train graph is byte-structurally like a BP training
+        #     graph: trainable params are runner-supplied inputs (the Perturb base is the input tensor),
+        #     while non-trainable tensors (BN running_mean/var) stay initializers. The perturbed forward
+        #     edge f"{idx}_{name}" still feeds the op. This makes the fixture directly deployable by
+        #     TrainDeeploy's ZO/BP pipeline with NO downstream promotion — the "make weights inputs" step
+        #     lives here in the exporter. zo_update already emits weights-as-inputs (optimizer in/out
+        #     contract; see generate_weight_update_graph). [Verified bit-exact on device: the deployed
+        #     input-form graph is identical to the previously-validated TrainDeeploy-promoted form.] -- QW
+        _promote_initializers_to_inputs(new_graph, perturbed_original_names)  # -- QW
 
         # Create and save the new model
         for op in original_model.opset_import:

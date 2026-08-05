@@ -535,6 +535,26 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
             mean = np.asarray(mean).reshape(shp); var = np.asarray(var).reshape(shp)
         return [(scale * (x - mean) / np.sqrt(var + eps) + bias).astype(x.dtype)]
 
+    # QW: Step 2 — BatchNormInternal (ORT training-mode BN forward, 5 outputs). We run frozen-stats BN
+    #     (uses the running mean/var inputs, no EMA update) since the ZO recipe freezes running stats;
+    #     the 4 extra outputs echo running_mean/var and the saved_mean/saved_inv_std. Only needed by the
+    #     base-stub run_onnx_graph; SpeechNet uses the PyTorch sim. -- QW
+    if op == "BatchNormInternal":  # -- QW
+        x, scale, bias, mean, var = inputs[:5]  # -- QW
+        eps = float(attrs.get("epsilon", 1e-5))  # -- QW
+        mean1 = np.asarray(mean).reshape(-1)  # -- QW
+        var1 = np.asarray(var).reshape(-1)  # -- QW
+        if x.ndim > 1:  # -- QW
+            shp = [1, x.shape[1]] + [1] * (x.ndim - 2)  # -- QW
+            sc = np.asarray(scale).reshape(shp); bs = np.asarray(bias).reshape(shp)  # -- QW
+            mn = np.asarray(mean).reshape(shp); vr = np.asarray(var).reshape(shp)  # -- QW
+        else:  # -- QW
+            sc, bs, mn, vr = scale, bias, mean, var  # -- QW
+        y = (sc * (x - mn) / np.sqrt(vr + eps) + bs).astype(x.dtype)  # -- QW
+        saved_mean = mean1.astype(np.float32)  # -- QW: frozen: saved == running -- QW
+        saved_inv_std = (1.0 / np.sqrt(var1 + eps)).astype(np.float32)  # -- QW
+        return [y, mean1.astype(np.float32), var1.astype(np.float32), saved_mean, saved_inv_std]  # -- QW
+
     if op == "LayerNormalization":
         x = inputs[0]
         scale = inputs[1] if len(inputs) > 1 and inputs[1] is not None else np.ones(1, dtype=x.dtype)
@@ -970,7 +990,11 @@ def run_onnx_graph(
         }
 
         try:
-            if domain in ("", "ai.onnx"):
+            # QW: Step 4 — Perturb ops now live in the DEFAULT domain (mezo domain dropped), so route
+            #     them to the MeZO executor regardless of domain before the standard fallthrough. -- QW
+            if op in _MEZO_OPS:  # -- QW
+                outs = _exec_mezo(op, node_inputs, attrs)  # -- QW
+            elif domain in ("", "ai.onnx"):
                 outs = _exec_standard(op, node_inputs, attrs)
             elif domain == "ai.onnx.contrib":
                 # For RequantShift, check if the 'add' input (3rd) is an initializer

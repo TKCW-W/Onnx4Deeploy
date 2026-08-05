@@ -644,8 +644,13 @@ class SpeechNetExporter(BaseONNXExporter):
             effective_data_size, lr, eps, seed, q, node_id_map,
         )
 
-        # outputs.npz : final weights + per-step references.
-        outputs_dict = {k: v for k, v in updated.items()}
+        # QW: Step 6 — outputs.npz carries ONLY the 22 trainable weights, plus log_prob + loss_plus +
+        #     loss_minus. Frozen BN running stats are NOT emitted (they never change under the ZO update).
+        #     Source the trainable names from the Perturb-node base weights (node_id_map keys) — these are
+        #     the 22 trainable params whether zo_train carries them as INITIALIZERS (reference design) or
+        #     as inputs. (Previously read from zt.input, which is empty in the initializer form.) -- QW
+        trainable_names = list(node_id_map.keys())  # -- QW
+        outputs_dict = {k: updated[k] for k in trainable_names if k in updated}  # -- QW
         outputs_dict["log_prob"] = np.concatenate(all_lp, axis=0).astype(np.float32)
         outputs_dict["loss_plus"] = np.array(all_lplus, dtype=np.float32)
         outputs_dict["loss_minus"] = np.array(all_lminus, dtype=np.float32)
@@ -654,16 +659,23 @@ class SpeechNetExporter(BaseONNXExporter):
         print(f"   outputs.npz: {n_upd} final weights + log_prob {outputs_dict['log_prob'].shape} "
               f"+ loss_plus/minus ({len(all_lplus)} step-losses)")
 
-        # inputs.npz : BP-style packing (arr_ for mb0 + mb{mb}_arr_ for the rest + meta).
-        zt_input_names = [i.name for i in zt.input]        # ['input', 'label']
+        # QW: Step 5 — inputs.npz packs ALL zo_train graph inputs in graph-input order:
+        #     `input`, `label`, + the 22 trainable weights (now graph INPUTS, not initializers), so
+        #     `testInitWeights` exist for the device runner. Mirrors the BP `create_training_test_data`
+        #     packing. Non-data windows still carry only data/label (mb{mb}_arr_0000/0001). -- QW
+        zt_input_names = [i.name for i in zt.input]        # ['input', 'label', + 22 weights]
         feed0 = {
             "input": np.asarray(test_inputs[0], np.float32),
             "label": np.atleast_1d(np.asarray(labels_list[0])).reshape(-1, 1).astype(np.int64),
         }
+        for wname, wval in init_map.items():  # -- QW: add the trainable weights to the mb0 feed -- QW
+            feed0[wname] = np.asarray(wval)  # -- QW
         save_dict = {}
         for npz_idx, name in enumerate(zt_input_names):
             if name in feed0:
                 save_dict[f"arr_{npz_idx:04d}"] = feed0[name]
+            else:  # -- QW
+                print(f"   zo_train input '{name}' missing from feed0 -- skipping")  # -- QW
         for mb in range(1, effective_data_size):
             save_dict[f"mb{mb}_arr_0000"] = np.asarray(test_inputs[mb], np.float32)
             save_dict[f"mb{mb}_arr_0001"] = np.atleast_1d(

@@ -682,21 +682,28 @@ class BaseONNXExporter(ABC):
         # Reference perturbed-forward log_prob, computed batch-1 (exactly as the device runs each window).
         log_probs = []
         for i in range(X.shape[0]):
-            lp = run_onnx_graph(self.paths["network_zo_train"], {"input": X[i:i + 1], "label": Y[i:i + 1]})
+            # QW: zo_train now outputs [loss, log_prob]; fetch log_prob by NAME (loss is first output). -- QW
+            lp = run_onnx_graph(self.paths["network_zo_train"], {"input": X[i:i + 1], "label": Y[i:i + 1]},
+                                output_names=["log_prob"])[0]  # -- QW
             log_probs.append(np.asarray(lp, np.float32))
         log_prob = np.concatenate(log_probs, axis=0)                                          # (N, classes)
         out = {"output": log_prob}
 
         # Updated weights from the in-place weight-update graph: request each perturbed tensor by name
         # (out-name == in-name, so `values[name]` holds the post-update value).
+        # QW: zo_update now takes params as graph INPUTS and emits `{param}_updated` as graph OUTPUTS.
+        #     Feed the base weights (from network_infer initializers) and fetch the `_updated` tensors. -- QW
         import onnx as _onnx
         upd_g = _onnx.load(self.paths["network_zo_update"]).graph
-        upd_names = [nd.input[0] for nd in upd_g.node if "Perturb" in nd.op_type]
+        base_map = self._load_init_map(self.paths["network_infer"])  # -- QW
+        upd_in_names = [i.name for i in upd_g.input]  # -- QW
+        upd_out_names = [o.name for o in upd_g.output]  # -- QW
         n_upd = 0
         try:
-            updated = run_onnx_graph(self.paths["network_zo_update"], {}, output_names=upd_names)
-            out.update({f"updated_{nm}": np.asarray(v) for nm, v in zip(upd_names, updated)})
-            n_upd = len(upd_names)
+            feed = {nm: np.asarray(base_map[nm]) for nm in upd_in_names if nm in base_map}  # -- QW
+            updated = run_onnx_graph(self.paths["network_zo_update"], feed, output_names=upd_out_names)  # -- QW
+            out.update({nm: np.asarray(v) for nm, v in zip(upd_out_names, updated)})  # -- QW
+            n_upd = len(upd_out_names)  # -- QW
         except Exception as e:
             print(f"   (weight-update reference skipped: {e})")
 

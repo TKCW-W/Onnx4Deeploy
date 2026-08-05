@@ -14,6 +14,28 @@ from onnx4deeploy.transform.model_transform import ensure_all_tensor_shapes
 #     ZO export free of the DeepQuant/brevitas dependency. -- QW
 # from DeepQuant.QuantDequantOnnx import Quant, Dequant, RequantShift
 
+# QW: helper — promote the given trainable initializers to graph INPUTS and DROP them from
+#     graph.initializer, so the ZO graphs are byte-structurally identical to a BP training graph
+#     (trainable params are runner-supplied inputs with no initializer). Non-trainable tensors
+#     (BN running_mean/var, `_mul` scales) stay as initializers. -- QW
+def _promote_initializers_to_inputs(graph, names) -> None:  # -- QW
+    name_set = set(names)  # -- QW
+    keep_inits = []  # -- QW
+    promoted = []  # -- QW
+    for init in graph.initializer:  # -- QW
+        if init.name in name_set:  # -- QW
+            promoted.append(init)  # -- QW
+        else:  # -- QW
+            keep_inits.append(init)  # -- QW
+    existing_inputs = {i.name for i in graph.input}  # -- QW
+    for init in promoted:  # -- QW
+        if init.name not in existing_inputs:  # -- QW
+            graph.input.append(  # -- QW
+                helper.make_tensor_value_info(init.name, init.data_type, list(init.dims))  # -- QW
+            )  # -- QW
+    del graph.initializer[:]  # -- QW
+    graph.initializer.extend(keep_inits)  # -- QW
+
 def generate_zo_graph(inference_onnx:str, output_onnx:str, zo_config:dict, noise_type: str, scales_path: str = None) -> None:
     """ Generate MeZO ONNX graph for model based on its inference onnx"""
 
@@ -92,7 +114,10 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
     canonical_id = {init.name: i for i, init in enumerate(model.graph.initializer)}
 
     for init in initializers:
-        perturbed_name = init.name  # Overwrite the initializer directly
+        # QW: Step 1 (zo_update) — the Perturb output is now the *_updated tensor (a graph OUTPUT),
+        #     while the base weight is a graph INPUT. Matches the BP optimizer-graph in/out contract
+        #     (param in → param_updated out) and fixes device in-place buffer-sharing name-match. -- QW
+        perturbed_name = f"{init.name}_updated"  # -- QW
         perturbation_counter = canonical_id[init.name]  # QW: consistent node_id (see above) -- QW
         if noise_type == "gaussian":
             node = helper.make_node(
@@ -100,7 +125,6 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
                 inputs=[init.name],
                 outputs=[perturbed_name],
                 name=f"perturbnormal_{perturbed_name}",
-                domain="mezo",
                 seed=seed,
                 eps=epsilon,
                 idx=perturbation_counter,
@@ -115,7 +139,6 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
                 inputs=[init.name],
                 outputs=[perturbed_name],
                 name=f"perturbuniform_{perturbed_name}",
-                domain="mezo",
                 idx=perturbation_counter,
                 seed=seed,
                 eps=epsilon,
@@ -223,7 +246,6 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
                 inputs=[init.name],
                 outputs=[perturbed_name],
                 name=f"perturbrademacher_{perturbed_name}",
-                domain="mezo",
                 idx=perturbation_counter,
                 seed=seed,
                 eps=epsilon,
@@ -261,7 +283,6 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
                 inputs=[init.name, f"{init.name}_mul"],
                 outputs=[perturbed_name],
                 name=f"rqs_perturb_rademacher_{perturbed_name}",
-                domain="mezo",
                 idx=perturbation_counter,
                 seed=seed,
                 signed=1,
@@ -305,7 +326,6 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
                 inputs=[init.name, f"{init.name}_mul"],
                 outputs=[perturbed_name],
                 name=f"rqs_perturb_uniform_{perturbed_name}",
-                domain="mezo",
                 seed=seed,
                 idx=perturbation_counter,
                 signed=1,
@@ -319,20 +339,32 @@ def generate_weight_update_graph(onnx_path: str, output_path: str, zo_config: di
         else:
             raise ValueError(f"Unsupported noise_type: {noise_type}")
 
-    # Build a minimal graph: no inputs, no outputs, just initializers and nodes
-    graph = helper.make_graph(
-        nodes=nodes,
-        name="weight_update_graph",
-        inputs=[],  # No inputs
-        outputs=[],  # No outputs
-        initializer=initializers
-    )
+    # QW: Step 1 (zo_update) — the trainable params are graph INPUTS and their `*_updated` results are
+    #     graph OUTPUTS (BP optimizer-graph in/out contract). Only non-trainable extras (e.g. `_mul`
+    #     scales for the RQS paths) remain as initializers. -- QW
+    trainable_names = {init.name for init in initializers}  # -- QW
+    graph_inputs = [  # -- QW
+        helper.make_tensor_value_info(init.name, init.data_type, list(init.dims))  # -- QW
+        for init in initializers  # -- QW
+    ]  # -- QW
+    graph_outputs = [  # -- QW
+        helper.make_tensor_value_info(f"{init.name}_updated", init.data_type, list(init.dims))  # -- QW
+        for init in initializers  # -- QW
+    ]  # -- QW
+    kept_initializers = [t for t in new_initializers if t.name not in trainable_names]  # -- QW
+    graph = helper.make_graph(  # -- QW
+        nodes=nodes,  # -- QW
+        name="weight_update_graph",  # -- QW
+        inputs=graph_inputs,  # -- QW: params in -- QW
+        outputs=graph_outputs,  # -- QW: *_updated out -- QW
+        initializer=kept_initializers  # -- QW: only non-trainable extras -- QW
+    )  # -- QW
 
-    # Use the same opset as the original model, plus mezo domain
+    # QW: Step 4 — drop the `mezo` opset; add com.microsoft (parity with zo_train). -- QW
     standard_opset_version = next((op.version for op in model.opset_import if op.domain == ""), 13)
     opset_list = [
         helper.make_opsetid("", standard_opset_version),
-        helper.make_opsetid("mezo", 1)
+        helper.make_opsetid("com.microsoft", 1)  # -- QW
     ]
     new_model = helper.make_model(graph, producer_name="mezo-weight-update", opset_imports=opset_list)
     onnx.save(new_model, output_path)
@@ -390,6 +422,7 @@ def inject_perturbation_nodes(
     def modify_graph(original_model: onnx.ModelProto, output_path: str, exceptions: list[str]):
         new_nodes = []
         extra_value_infos = []
+        perturbed_original_names = []  # QW: original trainable tensors we perturb → promote to inputs -- QW
 
         # Keep track of all initializers. We will add to this list.
         new_initializers = list(original_model.graph.initializer)
@@ -457,7 +490,6 @@ def inject_perturbation_nodes(
                                 inputs=[input_name],
                                 outputs=[perturbed_tensor_name],
                                 name=f"perturbnormal_{perturbed_tensor_name}",
-                                domain="mezo",
                                 seed=seed,
                                 eps=epsilon,
                                 idx=perturbation_counter,
@@ -473,7 +505,6 @@ def inject_perturbation_nodes(
                                 inputs=[input_name],
                                 outputs=[perturbed_tensor_name],
                                 name=f"perturbuniform_{perturbed_tensor_name}",
-                                domain="mezo",
                                 idx=perturbation_counter,
                                 seed=seed,
                                 eps=epsilon*2*np.sqrt(3),
@@ -491,7 +522,6 @@ def inject_perturbation_nodes(
                                 inputs=[input_name],
                                 outputs=[perturbed_tensor_name],
                                 name=f"perturbtriangle_{perturbed_tensor_name}",
-                                domain="mezo",
                                 idx=perturbation_counter,
                                 seed=seed,
                                 eps=epsilon*2*np.sqrt(6),
@@ -509,7 +539,6 @@ def inject_perturbation_nodes(
                                 inputs=[input_name],
                                 outputs=[perturbed_tensor_name],
                                 name=f"perturbrademacher_{perturbed_tensor_name}",
-                                domain="mezo",
                                 idx=perturbation_counter,
                                 seed=seed,
                                 eps=epsilon,
@@ -549,7 +578,6 @@ def inject_perturbation_nodes(
                                 inputs=[input_name, f"{input_name}_mul"],
                                 outputs=[perturbed_tensor_name],
                                 name=f"rqs_perturb_rademacher_{perturbed_tensor_name}",
-                                domain="mezo",
                                 idx=perturbation_counter,
                                 seed=seed,
                                 signed=1,
@@ -594,7 +622,6 @@ def inject_perturbation_nodes(
                                 inputs=[input_name, f"{input_name}_mul"],
                                 outputs=[perturbed_tensor_name],
                                 name=f"rqs_perturb_uniform_{perturbed_tensor_name}",
-                                domain="mezo",
                                 seed=seed,
                                 idx=perturbation_counter,
                                 signed=1,
@@ -721,6 +748,7 @@ def inject_perturbation_nodes(
 
                         # 5. Update the input list for the *original* node
                         modified_inputs[i] = perturbed_tensor_name
+                        perturbed_original_names.append(input_name)  # QW: promote to graph input -- QW
                         perturbation_counter += 1
 
                 if made_change:
@@ -731,16 +759,52 @@ def inject_perturbation_nodes(
                         # Use get_attribute_value to extract the python value from the AttributeProto
                         kwargs[attr.name] = helper.get_attribute_value(attr)
 
-                    # Create a new version of the Conv/Gemm node with the modified inputs
-                    new_original_node = helper.make_node(
-                        node.op_type,
-                        modified_inputs, # Use the updated input list
-                        node.output,
-                        name=node.name,
-                        domain=node.domain,
-                        **kwargs
-                    )
-                    new_nodes.append(new_original_node)
+                    # QW: Step 2 — re-emit BatchNormalization as the ORT training-mode BatchNormInternal
+                    #     (op com.microsoft, 5 outputs, training_mode=1) so the graph is structurally
+                    #     identical to a BP training graph. running_mean/var stay frozen initializers
+                    #     (only γ/β are perturbed above); the device BN_FROZEN_STATS flag / model.eval()
+                    #     reference keep the running stats fixed regardless of training_mode. -- QW
+                    if node.op_type == "BatchNormalization":  # -- QW
+                        y_out = node.output[0]  # -- QW
+                        extra_outs = [  # -- QW
+                            f"{node.name}_running_mean",  # -- QW
+                            f"{node.name}_running_var",  # -- QW
+                            f"{node.name}_saved_mean",  # -- QW
+                            f"{node.name}_saved_inv_std",  # -- QW
+                        ]  # -- QW
+                        bn_kwargs = {}  # -- QW
+                        if "epsilon" in kwargs:  # -- QW
+                            bn_kwargs["epsilon"] = kwargs["epsilon"]  # -- QW
+                        bn_kwargs["momentum"] = kwargs.get("momentum", 0.9)  # -- QW
+                        bn_kwargs["training_mode"] = 1  # -- QW
+                        new_original_node = helper.make_node(  # -- QW
+                            "BatchNormInternal",  # -- QW
+                            modified_inputs,  # -- QW
+                            [y_out] + extra_outs,  # -- QW
+                            name=node.name,  # -- QW
+                            domain="com.microsoft",  # -- QW
+                            **bn_kwargs,  # -- QW
+                        )  # -- QW
+                        new_nodes.append(new_original_node)  # -- QW
+                        # value_info for the 4 extra [C] outputs so shape inference passes. C == γ dim. -- QW
+                        gamma_name = node.input[1]  # -- QW
+                        gamma_init = next((t for t in new_initializers if t.name == gamma_name), None)  # -- QW
+                        C = int(gamma_init.dims[0]) if gamma_init is not None else 0  # -- QW
+                        for eo in extra_outs:  # -- QW
+                            extra_value_infos.append(  # -- QW
+                                helper.make_tensor_value_info(eo, TensorProto.FLOAT, [C])  # -- QW
+                            )  # -- QW
+                    else:  # -- QW
+                        # Create a new version of the Conv/Gemm node with the modified inputs
+                        new_original_node = helper.make_node(
+                            node.op_type,
+                            modified_inputs, # Use the updated input list
+                            node.output,
+                            name=node.name,
+                            domain=node.domain,
+                            **kwargs
+                        )
+                        new_nodes.append(new_original_node)
                 else:
                     # If no weights were perturbed, add the original node back unchanged
                     new_nodes.append(node)
@@ -760,18 +824,28 @@ def inject_perturbation_nodes(
             value_info=new_value_info
         )
 
+        # QW: The zo_train (perturbed-forward) graph keeps the trainable weights as INITIALIZERS —
+        #     this is the reference ZO design (the demo ZO graph and every downstream fixture expect
+        #     the base weight of each Perturb node to be a constant initializer, not a runner-supplied
+        #     input). An earlier revision promoted them to graph inputs to mirror the BP training graph;
+        #     that forced a downstream re-bake back to initializers and mis-set the Perturb base, so it
+        #     is reverted here. Only the zo_update graph keeps weights-as-inputs (optimizer in/out
+        #     contract; see generate_weight_update_graph). -- QW
+        # _promote_initializers_to_inputs(new_graph, perturbed_original_names)  # -- QW (reverted, see above)
+
         # Create and save the new model
         for op in original_model.opset_import:
             if op.domain == "":
                 standard_opset_version = op.version
                 break
 
+        # QW: Step 4 — drop the `mezo` opset. Perturb ops stay but in the DEFAULT domain; com.microsoft
+        #     is retained (now hosts BatchNormInternal). -- QW
         opset_list = [
             # Add the standard opset with the version we found
             helper.make_opsetid("", standard_opset_version),
 
             # Addcustom domains
-            helper.make_opsetid("mezo", 1),
             helper.make_opsetid("ai.onnx.contrib", 1),
             helper.make_opsetid("com.microsoft", 1)
         ]
@@ -828,25 +902,43 @@ def append_cross_entropy_loss(onnx_path, output_path, label_name='y', logits_out
 
     # add the new label input using resolved batch_dim
     label_vi = helper.make_tensor_value_info(label_input_name, TensorProto.INT64, [batch_dim, 1])
-    graph.input.append(label_vi)
+    # QW: place label right after 'input' (index 1) so the DATA inputs (input, label) come first,
+    #     BEFORE the promoted weight inputs — matches the BP training-graph order [input, labels, weights…]
+    #     and TrainDeeploy's index-based per-mb data loading (inputs[0..num_data-1] = data). Rebuild the
+    #     repeated field to avoid protobuf insert-version issues. -- QW
+    _prev_inputs = list(graph.input)  # -- QW  ([input, w0, b0, ... 22 weights])
+    del graph.input[:]  # -- QW
+    graph.input.append(_prev_inputs[0])  # -- QW  input
+    graph.input.append(label_vi)         # -- QW  label at index 1
+    for _vi in _prev_inputs[1:]:         # -- QW  the 22 weight inputs
+        graph.input.append(_vi)          # -- QW
 
-    # create loss node (standard SoftmaxCrossEntropyLoss) with proper attribute
-    logprob = "log_prob"
+    # QW: Step 3 — canonical 2-output SoftmaxCrossEntropyLoss, structurally identical to the BP
+    #     ORT-artifacts loss node: outputs are [loss, log_prob] (loss FIRST), reduction="mean".
+    #     Graph outputs = loss (FLOAT, scalar []) + log_prob (FLOAT, [B, K]). -- QW
+    logprob = "log_prob"  # -- QW
+    loss_name = "loss"  # -- QW
     loss_node = helper.make_node(
         "SoftmaxCrossEntropyLoss",
         inputs=[logits_name, label_input_name],
-        outputs=[logprob],
+        outputs=[loss_name, logprob],  # -- QW: loss first, then log_prob -- QW
         name="CrossEntropyLoss",
         reduction=reduction,
     )
     graph.node.append(loss_node)
 
-    # replace graph outputs with the log prob
-    output_shape = [d.dim_value if d.HasField("dim_value") else d.dim_param 
+    # replace graph outputs with [loss (scalar), log_prob (B,K)]
+    output_shape = [d.dim_value if d.HasField("dim_value") else d.dim_param
                     for d in graph.output[0].type.tensor_type.shape.dim]
-    
+
     del graph.output[:]
-    graph.output.append(helper.make_tensor_value_info(logprob, TensorProto.FLOAT, output_shape))
+    graph.output.append(helper.make_tensor_value_info(loss_name, TensorProto.FLOAT, []))  # -- QW: scalar loss -- QW
+    graph.output.append(helper.make_tensor_value_info(logprob, TensorProto.FLOAT, output_shape))  # -- QW
+    # QW: the logits tensor (former graph output, now an intermediate feeding SCE) must keep its shape
+    #     as value_info — ORT can't re-infer it because upstream custom Perturb ops block inference, so
+    #     TrainDeeploy's _assertTensorsHaveShape would otherwise fail on this one tensor. -- QW
+    if logits_name not in {vi.name for vi in graph.value_info}:  # -- QW
+        graph.value_info.append(helper.make_tensor_value_info(logits_name, TensorProto.FLOAT, output_shape))  # -- QW
 
     # try to infer shapes and save
     try:

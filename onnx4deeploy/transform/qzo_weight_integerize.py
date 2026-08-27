@@ -221,7 +221,9 @@ def _annotate_shapes_via_run(model: onnx.ModelProto) -> onnx.ModelProto:
                  np.dtype("int64"): TP_I64}
     g = model.graph
     shape = [d.dim_value for d in g.input[0].type.tensor_type.shape.dim]
-    dummy = np.zeros(shape, dtype=np.int8)
+    # dummy matches the graph input's dtype (int8 for offline-quantised input, fp32 for online-quantised). -- QW
+    _np_of = {TP_I8: np.int8, TP_I32: np.int32, TP_F32: np.float32, TP_I64: np.int64}
+    dummy = np.zeros(shape, dtype=_np_of.get(g.input[0].type.tensor_type.elem_type, np.float32))
     have = {o.name for o in g.output} | {i.name for i in g.input} | {i.name for i in g.initializer}
     outs = [o for n in g.node for o in n.output if o not in have]
     tmp = _os.path.join(_tf.gettempdir(), "_qzo_shape.onnx")

@@ -718,7 +718,11 @@ class BaseONNXExporter(ABC):
         finally:
             _os.chdir(_cwd); _eb_mod.torch.allclose = _orig_ac
         _shutil.copyfile(out_dir / "4_model_dequant_moved.onnx", net)
-        create_quant_pipeline(inputs_npz_path=str(out_dir / "inputs.npz")).run(net, net)
+        # QW: keep the input quantised ONLINE — pass inputs_npz_path=None so the shipped QuantInputOfflinePass
+        #     is disabled. The graph then keeps `input(fp32) → Quant(s_in) → int8 → conv` and inputs.npz['input']
+        #     stays the raw fp32 window (matches the earlier design; offline-int8 input was an unintended
+        #     side effect of building on the -mode quant pipeline). -- QW
+        create_quant_pipeline(inputs_npz_path=None).run(net, net)
 
         # 3-4. QZO train + update graphs (offline int8 weights, weights-as-INPUTS) ----------------------
         print("🔧 build_qzo_train_graph + build_qzo_update_graph...")

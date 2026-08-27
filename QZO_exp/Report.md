@@ -464,3 +464,40 @@ Commits: Onnx4Deeploy `6f94be6` (shape annotations); TrainDeeploy `5e786aa`+`967
    of the conv bias; keep weight perturb as-is. Mirror in `build_qzo_update_graph`.
 2. Re-run codegen → expect full mapping; then real GVSoC sim (drop `--skipsim`), compare device L±/grad vs host
    `outputs.npz`, and grep `TrainingNetwork.c` for int8 pulp-nn conv.
+
+---
+
+## Iteration 9 — bias→RequantShift-add restructure; 3 more device fixes; conv-parser blocker (2026-08-27)
+
+Restructured `build_int8_forward` to the device-compatible datapath (Onnx4Deeploy commit): **2-input Conv**
+(int8 weight only) with the int32 bias moved into the **RequantShift `add`**; **2-input Gemm** with the fc bias
+moved to an **fp32 `Add`** after the per-channel dequant. Re-validated eps=0 forward (identity). Fixed three
+device-codegen blockers in order:
+
+1. **`_merge_conv_rq_fun` `.values` crash** (TrainDeeploy `Passes.py`): the merge baked rounding into the RQS
+   `add` assuming a constant; a perturbed **variable** add has no `.values`. Guarded — bake only for a
+   constant add; a variable add truncates (kernel matches host `add_is_initializer=False`).
+2. **int32 bias perturb wouldn't map**: the bias mul used `DIV_B=2^31` → `mul=round(eps/s_b·2^31)≈5e12`
+   **overflows int32** (binding expects `int32_t`). Fix: `DIV_B=2^16` (= the RequantShift div; mul≈1.6e8 fits)
+   and emit **all perturb muls as int32**. → the `[int32,int32]→[int32]` bias binding now maps.
+3. Cherry-picked the remaining QZO_mixed device commit **de7321c** (Quant/Dequant tiling-ready bindings) to
+   complete the port. TrainDeeploy `feat/QZO` now has all three QZO_mixed device commits + the merge guard.
+
+**REMAINING blocker (real):** codegen reaches the merged `RequantizedConv` (`_MERGE_CONVRQ_PASS_0`,
+`PULPRQSConvLayer`) and **exhausts backtracking** — the PULP conv parser (`PULPConv2DParser` et al.) rejects a
+**variable (perturbed) weight**. Confirmed this fails even **weight-only** (bias unperturbed, `PERTURB_BIAS=
+False`), so it's the int8 conv+perturbed-weight itself, not the bias. Crucially, `git diff feat/QZO
+feat/QZO_mixed` for the conv Parsers/Bindings/`testMVPTraining.py`/`DeeployTypes.py` is **empty** — the device
+code is identical to QZO_mixed's (which compiled). ⇒ **the mapping difference must be the fixture graph
+structure**, not the Deeploy code.
+
+Commits: Onnx4Deeploy (bias-in-RQS-add + int32 mul + `PERTURB_BIAS`); TrainDeeploy `ee569cf` (merge guard) +
+`8a853ce` (de7321c port).
+
+### Next iteration (10) — compare our fixture to QZO_mixed's working int8 graph
+Get QZO_mixed's compiling fixture (`ETH/quantzo_work/qzo_mixed/` outputs or a packed
+`speechnet_qzo_mixed_int8_train`) and diff its **RequantizedConv/weight** structure against ours: dtype/nLevels
+on the perturbed weight edge, whether the conv weight is a graph **input** vs an intermediate, the
+`RQSPerturbRademacher` output typing, and any attrs the PULP conv parser requires (e.g. weight `nLevels`,
+`signed`, group). Align our `build_int8_forward`/`build_qzo_train_graph` emission to match, then finish codegen
+→ GVSoC sim → compare device L±/grad vs host.

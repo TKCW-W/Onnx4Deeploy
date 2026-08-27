@@ -687,10 +687,11 @@ class BaseONNXExporter(ABC):
         eps = float(zo_cfg.get("epsilon", 0.01)); seed = int(zo_cfg.get("seed", 42))
         net = _os.path.join(str(out_dir), "network.onnx")
 
-        # 1. pretrained brevitas model + fold BN + REAL-data calibration --------------------------------
-        print("📦 Creating Brevitas model (pretrained) + folding Conv-BN + real-data PTQ calibration...")
+        # 1. pretrained brevitas model + REAL-data calibration --------------------------------
+        # QW: DO NOT fold Conv-BN for QZO — we keep BN UNFOLDED (fp32) so its γ/β stay trainable in the ZO
+        #     graph as BatchNormInternal (matches the float-ZO exp6 fixture + the quant design). -- QW
+        print("📦 Creating Brevitas model (pretrained, BN UNFOLDED) + real-data PTQ calibration...")
         model = self.create_brevitas_model(); model.eval()
-        _fold_conv_bn_inplace(model)
         ishape = self.get_input_shape()
         # a REAL labeled window (for the example + the fixture input/label); fall back to calib data
         try:

@@ -73,13 +73,19 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
     initmap = {i.name: i for i in g.initializer}
     param_inputs, new_nodes, promote = {}, [], []
 
-    for pname, scale, div, nlev, idx, in_idx, node in _iter_qzo_params(model, scale_map):
-        mul = np.round(eps / scale * div).astype(np.int32)      # int32 mul (RQSPerturb binding expects int32_t)
-        mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
-        g.initializer.append(mk)
-        new_nodes.append(helper.make_node(
-            "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_pert"],
-            name=f"rqsp_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
+    for p in _iter_qzo_params(model, scale_map):
+        pname, node, in_idx, idx = p["name"], p["node"], p["in_idx"], p["idx"]
+        if p["kind"] == "rqs":                                  # int8 weight / int32 bias
+            mul = np.round(eps / p["scale"] * p["div"]).astype(np.int32)   # int32 mul (binding expects int32_t)
+            mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
+            g.initializer.append(mk)
+            new_nodes.append(helper.make_node(
+                "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_pert"],
+                name=f"rqsp_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=p["div"], n_levels=p["nlev"]))
+        else:                                                   # fp32 BN γ/β + fc bias — float Rademacher
+            new_nodes.append(helper.make_node(
+                "PerturbRademacher", [pname], [f"{pname}_pert"],
+                name=f"pert_{pname}", domain="mezo", idx=idx, seed=seed, eps=eps))
         node.input[in_idx] = f"{pname}_pert"
         promote.append(pname)
         w = numpy_helper.to_array(initmap[pname])
@@ -104,28 +110,42 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
 
 
 def _iter_qzo_params(model, scale_map):
-    """Yield (param_name, scale, div, n_levels, idx, target_input_idx, target_node) for each perturbable
-    param in graph order — SHARED by train + update so the perturb z matches. After build_int8_forward the
-    trainable params are: each Conv/Gemm int8 **weight** (input[1]); each conv **bias** which now lives in
-    the following **RequantShift `add`** (int32, input[2]). The fc bias became an fp32 constant Add (not
-    perturbed in the current device step)."""
+    """Yield a dict per perturbable param (SHARED by train + update so the perturb z matches):
+      rqs   : {kind:'rqs',   name, scale, div, nlev, idx, in_idx, node}  — int8 weight / int32 bias.
+      float : {kind:'float', name, idx, in_idx, node}                    — fp32 BN γ/β, fc bias.
+    Order: each Conv/Gemm int8 **weight** (input[1]); each conv int32 **bias** in the RequantShift `add`
+    (input[2]); each **BatchNormInternal γ and β** (input[1]/[2], trained fp32); the **fc bias** (the fp32
+    `fc_bias_add` constant input). BN γ/β + fc bias use float `PerturbRademacher` (fp32 path)."""
     initmap = {i.name: i for i in model.graph.initializer}
     node_by_name = {n.name: n for n in model.graph.node}
     idx = 0
-    for n in model.graph.node:
+    for n in model.graph.node:                                         # 1. int8 conv/fc weights + int32 biases
         if n.op_type not in ("Conv", "Gemm"):
             continue
         ent = scale_map.get(n.name)
         if ent is None:
             continue
         if len(n.input) > 1 and n.input[1] in initmap:                 # int8 weight
-            yield n.input[1], np.asarray(ent["weight_scale"], np.float64).reshape(-1), DIV_W, NL_W, idx, 1, n
+            yield dict(kind="rqs", name=n.input[1], scale=np.asarray(ent["weight_scale"], np.float64).reshape(-1),
+                       div=DIV_W, nlev=NL_W, idx=idx, in_idx=1, node=n)
             idx += 1
         if PERTURB_BIAS and "bias_rqs_name" in ent:                    # int32 bias in the RequantShift add
             rqs = node_by_name.get(ent["bias_rqs_node"])
             if rqs is not None and ent["bias_rqs_name"] in initmap:
-                yield ent["bias_rqs_name"], np.asarray(ent["bias_scale"], np.float64).reshape(-1), DIV_B, NL_B, idx, 2, rqs
+                yield dict(kind="rqs", name=ent["bias_rqs_name"], scale=np.asarray(ent["bias_scale"], np.float64).reshape(-1),
+                           div=DIV_B, nlev=NL_B, idx=idx, in_idx=2, node=rqs)
                 idx += 1
+    for n in model.graph.node:                                         # 2. BN γ/β — fp32, float Rademacher
+        if n.op_type != "BatchNormInternal":
+            continue
+        for in_idx in (1, 2):
+            if n.input[in_idx] in initmap:
+                yield dict(kind="float", name=n.input[in_idx], idx=idx, in_idx=in_idx, node=n)
+                idx += 1
+    fcadd = node_by_name.get("fc_bias_add")                            # 3. fc bias — fp32, float Rademacher
+    if fcadd is not None and len(fcadd.input) > 1 and fcadd.input[1] in initmap:
+        yield dict(kind="float", name=fcadd.input[1], idx=idx, in_idx=1, node=fcadd)
+        idx += 1
 
 
 def build_qzo_update_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42):
@@ -142,20 +162,26 @@ def build_qzo_update_graph(quant_network_onnx: str, out_path: str, eps: float = 
     src_inits = {i.name: i for i in src.graph.initializer}
     nodes, ginputs, goutputs, inits, param_inputs = [], [], [], [], {}
 
-    for pname, scale, div, nlev, idx, in_idx, _n in _iter_qzo_params(src, scale_map):
+    for p in _iter_qzo_params(src, scale_map):
+        pname, idx = p["name"], p["idx"]
         arr = numpy_helper.to_array(src_inits[pname])
         param_inputs[pname] = arr
         ginputs.append(helper.make_tensor_value_info(pname, src_inits[pname].data_type, list(arr.shape)))
         goutputs.append(helper.make_tensor_value_info(f"{pname}_updated", src_inits[pname].data_type, list(arr.shape)))
-        mul = np.round(eps / scale * div).astype(np.int32)      # int32 mul (RQSPerturb binding expects int32_t)
-        mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
-        inits.append(mk)
-        nodes.append(helper.make_node(
-            "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_updated"],
-            name=f"rqsp_upd_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
+        if p["kind"] == "rqs":
+            mul = np.round(eps / p["scale"] * p["div"]).astype(np.int32)   # int32 mul (binding expects int32_t)
+            mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
+            inits.append(mk)
+            nodes.append(helper.make_node(
+                "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_updated"],
+                name=f"rqsp_upd_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=p["div"], n_levels=p["nlev"]))
+        else:                                                   # fp32 BN γ/β + fc bias
+            nodes.append(helper.make_node(
+                "PerturbRademacher", [pname], [f"{pname}_updated"],
+                name=f"pert_upd_{pname}", domain="mezo", idx=idx, seed=seed, eps=eps))
 
     graph = helper.make_graph(nodes, "qzo-weight-update", ginputs, goutputs, inits)
-    opset = [helper.make_opsetid("", 13), helper.make_opsetid("mezo", 1)]
+    opset = [helper.make_opsetid("", 13), helper.make_opsetid("mezo", 1), helper.make_opsetid("com.microsoft", 1)]
     onnx.save(helper.make_model(graph, producer_name="qzo-weight-update", opset_imports=opset), out_path)
     print(f"  [qzo] int8 zo_update graph ({len(nodes)} RQSPerturb, params in/updated out) -> {out_path}")
     return out_path, param_inputs

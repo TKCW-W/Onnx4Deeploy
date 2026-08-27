@@ -348,6 +348,28 @@ def build_int8_forward(
             else:
                 g.node.append(onnx.helper.make_node("Mul", [gemm_out, sc.name], ["output"], name="fc_dequant_mul"))
 
+    # Re-emit each unfolded fp32 BatchNormalization as BatchNormInternal (com.microsoft, training_mode=1,
+    # 5 outputs) — the ORT training-mode BN, matching the float-ZO exp6 fixture. γ/β stay as inputs (promoted
+    # + perturbed downstream); running_mean/var stay frozen initializers. -- QW
+    initset = {i.name for i in g.initializer}
+    new_nodes = []
+    for n in g.node:
+        if n.op_type == "BatchNormalization":
+            eps_a = next((a.f for a in n.attribute if a.name == "epsilon"), 1e-5)
+            mom_a = next((a.f for a in n.attribute if a.name == "momentum"), 0.9)
+            extra = [f"{n.name}_rm", f"{n.name}_rv", f"{n.name}_sm", f"{n.name}_siv"]
+            bn = onnx.helper.make_node("BatchNormInternal", list(n.input), [n.output[0]] + extra,
+                                       name=n.name, domain="com.microsoft",
+                                       epsilon=float(eps_a), momentum=float(mom_a), training_mode=1)
+            new_nodes.append(bn)
+            gi = initmap.get(n.input[1])
+            C = int(gi.dims[0]) if gi is not None else 0
+            for eo in extra:
+                g.value_info.append(onnx.helper.make_tensor_value_info(eo, TP_F32, [C]))
+        else:
+            new_nodes.append(n)
+    del g.node[:]; g.node.extend(new_nodes)
+
     for n in g.node:
         if n.op_type in ("Quant", "Dequant", "RequantShift"):
             n.domain = "ai.onnx.contrib"

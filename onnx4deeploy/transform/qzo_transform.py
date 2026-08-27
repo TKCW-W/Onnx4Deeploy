@@ -47,7 +47,7 @@ DIV_B, NL_B = 2 ** 16, 2 ** 32      # bias  perturb: int32, div=2^16 (= the Requ
 # QW: perturb the int32 bias (in the RequantShift add) as well as the int8 weights. Setting this False keeps
 #     the bias a baked constant (standard RequantizedConv with a variable weight only) — the lower-risk device
 #     path for the first single-step smoke test; True needs the RQSConv parser to accept a variable add. -- QW
-PERTURB_BIAS = False
+PERTURB_BIAS = True
 
 
 def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42,

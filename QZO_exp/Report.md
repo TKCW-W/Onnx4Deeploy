@@ -291,3 +291,40 @@ from the export + per-channel scales (offline weights), reproducing PyTorch. Kno
 4. `generate_weight_update_graph` → `network_zo_update.onnx`. Wire `_export_qzo_training` through this
    (comment out `build_qzo_int8_graph`); export real-data fixture to `QZO_exp/exp2/` with `inputs.npz`
    (int8 weights+biases as inputs) + host L+/L- reference.
+
+---
+
+## Iteration 5 — QZO zo_train graph builder (VALIDATED) (2026-08-27)
+
+### `RQSPerturbRademacher` semantics (confirmed from `_perturb_rqs_rademacher`)
+`noise_q = (rad·mul + rounding) >> log2(div)`, added to the int64-cast data, clipped to
+`[-(n_levels/2)+1, n_levels/2-1]`. **eps=0 ⇒ mul=0 ⇒ identity** (`rounding = 2^(S-1)`, `>>S = 0`). Magnitudes:
+weight int8 `div=2^15, n_levels=256, mul[c]=round(eps/s_w[c]·2^15)`; bias int32 `div=2^31, n_levels=2^32,
+mul[c]=round(eps/s_b[c]·2^31)` — perturbs each by ±eps in real units.
+
+### Implemented `build_qzo_train_graph` in `qzo_transform.py` — VERIFIED
+Extends the pipeline (no from-model rebuild): `build_int8_forward` (iter-4, validated) → inject
+`RQSPerturbRademacher` on each Conv/Gemm weight+bias (mul from the per-channel `scale_map`) → promote the int8
+weights + int32 biases to graph **INPUTS** (shared `_promote_initializers_to_inputs`) → append canonical
+`SoftmaxCrossEntropyLoss` (shared `append_cross_entropy_loss`). Deprecated the old from-model
+`build_qzo_int8_graph` in-place (commented, kept).
+
+**Validation (`run_onnx_graph` on real int8 data):**
+- **14 graph inputs** = `input, label` + **12 trainable params** (6 conv/fc weights int8 + 6 biases int32) —
+  weights-as-INPUTS ✅.
+- **12 `RQSPerturbRademacher`** (6 weight + 6 bias).
+- **eps=0**: loss=0.392, `log_prob` argmax **0** (== inference/PyTorch) — identity ✅.
+- **eps=0.01**: loss=0.451 (0.05 → 2.10) — the graph responds to perturbation ✅.
+
+This is the complete, validated QZO **zo_train** fixture: offline int8 weights, weights+biases as inputs,
+per-channel RequantShift, RQSPerturb, SCE loss — a true extension of the float ZO + shipped quant pipelines.
+
+### Next iteration (6) — update graph, wiring, real-data fixture
+1. **zo_update graph**: mirror `generate_weight_update_graph` for the int8 params (RQSPerturb each int8
+   weight/int32 bias → `*_updated` output; weights as INPUTS) → `network_zo_update.onnx`.
+2. **Wire `_export_qzo_training`**: brevitas model + PTQ calibrate on real SilentWear → `exportBrevitas` +
+   `create_quant_pipeline` (needs `PYTHONPATH=…/DeepQuant`) → `build_qzo_train_graph` + update graph; write
+   `inputs.npz` (params as inputs) + host L+/L− reference (`outputs.npz`). Comment out the
+   `generate_zo_graph(qzo_model=…)` branch that called `build_qzo_int8_graph`.
+3. Export the **real-data** fixture (fold_3 pretrained, S01/sess3/vocalized) to `QZO_exp/exp2/`.
+4. Then (optional) the TrainDeeploy single-step smoke test.

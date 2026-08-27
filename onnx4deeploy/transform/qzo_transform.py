@@ -33,8 +33,78 @@ def _np(x):
     return x.detach().cpu().float().numpy()
 
 
+# ===========================================================================================
+# QZO offline-int8 flow (feat/QZO, iteration 5) — the CURRENT builder.
+# Transforms the `-mode quant` integer export into a validated int8 ZO datapath (offline int8
+# weights, weights+biases as INPUTS, per-channel RequantShift), then injects RQSPerturbRademacher.
+# This EXTENDS the pipeline (build_int8_forward on the export + the float ZO helpers
+# _promote_initializers_to_inputs / append_cross_entropy_loss) rather than rebuilding from the
+# torch model. Supersedes build_qzo_int8_graph (kept below, deprecated, per comment-don't-delete).
+# ===========================================================================================
+DIV_W, NL_W = 2 ** 15, 256          # weight perturb: int8, div=2^15, n_levels=256
+DIV_B, NL_B = 2 ** 31, 2 ** 32      # bias perturb:   int32, div=2^31, n_levels=2^32
+
+
+def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42,
+                          label_name: str = "label"):
+    """Build the QZO int8 zo_train graph from the `-mode quant` integer export.
+
+    Steps (all verified on real SpeechNet, host==PyTorch):
+      1. build_int8_forward: rebuild the correct int8 datapath (per-channel RequantShift, offline int8
+         weights + int32 biases as Conv/Gemm inputs, fc per-channel dequant). Forward matches PyTorch.
+      2. inject RQSPerturbRademacher on each Conv/Gemm weight (int8, div=2^15) and bias (int32, div=2^31),
+         mul = round(eps/scale · div) from the per-channel scale_map.
+      3. promote the int8 weights + int32 biases to graph INPUTS (_promote_initializers_to_inputs).
+      4. append the canonical SoftmaxCrossEntropyLoss (shared float-ZO helper).
+
+    Returns (out_path, param_inputs) where param_inputs {name: int-ndarray} are the trainable INPUT values
+    for inputs.npz. eps=0 → identity (== inference); eps>0 → perturbed (L±).
+    """
+    from onnx4deeploy.transform.qzo_weight_integerize import build_int8_forward, _toposort
+    from onnx4deeploy.transform.zo_transform import _promote_initializers_to_inputs, append_cross_entropy_loss
+
+    model, scale_map = build_int8_forward(onnx.load(quant_network_onnx))
+    g = model.graph
+    initmap = {i.name: i for i in g.initializer}
+    param_inputs, new_nodes, promote, idx = {}, [], [], 0
+
+    for n in g.node:
+        if n.op_type not in ("Conv", "Gemm"):
+            continue
+        ent = scale_map.get(n.name)
+        if ent is None:
+            continue
+        for in_idx, key, div, nlev in ((1, "weight_scale", DIV_W, NL_W), (2, "bias_scale", DIV_B, NL_B)):
+            pname = n.input[in_idx]
+            if pname not in initmap:
+                continue
+            scale = np.asarray(ent[key], np.float64).reshape(-1)
+            mul = np.round(eps / scale * div).astype(np.int64).astype(np.float32)
+            mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
+            g.initializer.append(mk)
+            new_nodes.append(helper.make_node(
+                "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_pert"],
+                name=f"rqsp_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
+            n.input[in_idx] = f"{pname}_pert"
+            promote.append(pname)
+            param_inputs[pname] = numpy_helper.to_array(initmap[pname])
+            idx += 1
+
+    g.node.extend(new_nodes)
+    _promote_initializers_to_inputs(g, promote)
+    _toposort(model)
+    onnx.save(model, out_path)
+    append_cross_entropy_loss(out_path, out_path, label_name=label_name)
+    print(f"  [qzo] int8 zo_train graph (offline weights-as-inputs, {idx} RQSPerturb) -> {out_path}")
+    return out_path, param_inputs
+
+
+# --- DEPRECATED (feat/QZO iter-1..2): from-model rebuilder with ONLINE per-channel weight Quant. -----------
+# Kept for reference (comment-don't-delete). Superseded by build_qzo_train_graph above: (a) it rebuilt the
+# graph from the torch model instead of transforming the export; (b) its online per-channel weight Quant does
+# not fold in Deeploy (QuantPatternPass is per-tensor). The offline-int8 flow avoids both. -- QW
 def build_qzo_int8_graph(model, scales, out_path, eps=0.01, seed=42, label_name="label"):
-    """Build the int8 QZO graph (weights-as-inputs, Add/Sub, BatchNormInternal); NO loss (generate_zo_graph adds it)."""
+    """[DEPRECATED — see build_qzo_train_graph] Build the int8 QZO graph (weights-as-inputs, Add/Sub, BatchNormInternal); NO loss (generate_zo_graph adds it)."""
     model.eval()
     nodes, inits, ginfo = [], [], []
     param_inputs = {}                      # trainable INPUT name -> value (for inputs.npz)

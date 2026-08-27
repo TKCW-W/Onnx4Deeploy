@@ -429,3 +429,38 @@ Pack `QZO_exp/exp2` → `Tests/Models/Training/SpeechNet/speechnet_qzo_{train,up
 PID; run `deeployMezoRunner_tiled_siracusa.py` (n_steps 1, n_accum 1, num-data-inputs 2, eps 0.01, seed 42,
 `-D BN_FROZEN_STATS=ON`); compare device L±/grad vs host `outputs.npz`; grep generated `TrainingNetwork.c` for
 int8 pulp-nn conv (not `PULP_Conv2d_Im2Col_fp32`).
+
+---
+
+## Iteration 8 — TrainDeeploy device codegen: unblocked 3 issues, one remaining (2026-08-27)
+
+Packed `QZO_exp/exp2` → `Tests/Models/Training/SpeechNet/speechnet_qzo_{train,update}` (pack = 3-file copy).
+Ran `deeployMezoRunner_tiled_siracusa.py … --skipsim` (codegen only) in `deeploy_arm_mounted`; killed orphan
+gvsoc by PID first. Fixed issues in order:
+
+1. **`_isDepthwise` crash** (`node.inputs[1].shape is None`): the RQSPerturb perturbed-weight edge had no
+   shape. Fix (Onnx4Deeploy): annotate the `{pname}_pert` edge shape/dtype in `build_qzo_train_graph`.
+2. **`_assertTensorsHaveShape`** (fc-region intermediates shapeless — custom Quant/Dequant block inference):
+   Fix: `_annotate_shapes_via_run` in `build_int8_forward` — run the graph once, stamp exact shape/dtype on
+   every intermediate, **overwriting** stale shapeless `value_info` (the first pass missed 3 that already had
+   empty entries).
+3. **"No mapping for RQSPerturbRademacher"**: TrainDeeploy `feat/QZO` had the **float** `PerturbRademacher`
+   stack but **no `RQSPerturbRademacher`** device op. Found the port on `feat/QZO_mixed` (commits `6995090`
+   "port RQSPerturbRademacher to Deeploy" + `7cc4199` "zo_update mapping + sign-flip") — **cherry-picked both
+   cleanly onto `feat/QZO`** (adds Parser/TypeChecker/Binding/2 Templates/TileConstraint + `RandomNoiseQuant.c`
+   kernel). Codegen now **maps the int8 weight perturbs**.
+4. **REMAINING** — backtracking exhausted at Layer 11 `rqsp_blocks0convbias_int32` (the int32 **bias**
+   perturb). Root cause: our datapath feeds the perturbed **int32 bias into the Conv** (3rd input), but the
+   device int8-conv binding won't consume a *variable* int32 bias — the float-ZO-quant + QZO_mixed convention
+   puts the perturbed int32 bias in the **RequantShift `add`**. (This is the "bias-in-RQS-add" variant I
+   already validated earlier at maxdiff **0.008**, even better than bias-in-Conv's 0.032.)
+
+Commits: Onnx4Deeploy `6f94be6` (shape annotations); TrainDeeploy `5e786aa`+`967dba5` (RQSPerturb port).
+
+### Next iteration (9) — bias in RequantShift add, then finish codegen + sim
+1. Restructure `build_int8_forward`: **2-input Conv** (int8 weight only) + RequantShift `mul[c]=round(s_w[c]·
+   div)`, **`add[c]` = int32 bias** (the perturbable term). Re-validate the forward vs PyTorch (expect the
+   0.008 variant). Update `build_qzo_train_graph` to perturb the RequantShift `add` (RQSPerturb int32) instead
+   of the conv bias; keep weight perturb as-is. Mirror in `build_qzo_update_graph`.
+2. Re-run codegen → expect full mapping; then real GVSoC sim (drop `--skipsim`), compare device L±/grad vs host
+   `outputs.npz`, and grep `TrainingNetwork.c` for int8 pulp-nn conv.

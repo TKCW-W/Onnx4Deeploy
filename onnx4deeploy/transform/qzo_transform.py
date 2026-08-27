@@ -66,9 +66,34 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
     model, scale_map = build_int8_forward(onnx.load(quant_network_onnx))
     g = model.graph
     initmap = {i.name: i for i in g.initializer}
-    param_inputs, new_nodes, promote, idx = {}, [], [], 0
+    param_inputs, new_nodes, promote = {}, [], []
 
-    for n in g.node:
+    for pname, scale, div, nlev, idx, in_idx, node in _iter_qzo_params(model, scale_map):
+        mul = np.round(eps / scale * div).astype(np.int64).astype(np.float32)
+        mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
+        g.initializer.append(mk)
+        new_nodes.append(helper.make_node(
+            "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_pert"],
+            name=f"rqsp_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
+        node.input[in_idx] = f"{pname}_pert"
+        promote.append(pname)
+        param_inputs[pname] = numpy_helper.to_array(initmap[pname])
+
+    g.node.extend(new_nodes)
+    _promote_initializers_to_inputs(g, promote)
+    _toposort(model)
+    onnx.save(model, out_path)
+    append_cross_entropy_loss(out_path, out_path, label_name=label_name)
+    print(f"  [qzo] int8 zo_train graph (offline weights-as-inputs, {len(promote)} RQSPerturb) -> {out_path}")
+    return out_path, param_inputs
+
+
+def _iter_qzo_params(model, scale_map):
+    """Yield (param_name, scale_array, div, n_levels, idx) for each Conv/Gemm weight+bias in graph order.
+    Canonical order (weight then bias per Conv/Gemm) — SHARED by train + update so the perturb z matches."""
+    initmap = {i.name: i for i in model.graph.initializer}
+    idx = 0
+    for n in model.graph.node:
         if n.op_type not in ("Conv", "Gemm"):
             continue
         ent = scale_map.get(n.name)
@@ -78,24 +103,40 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
             pname = n.input[in_idx]
             if pname not in initmap:
                 continue
-            scale = np.asarray(ent[key], np.float64).reshape(-1)
-            mul = np.round(eps / scale * div).astype(np.int64).astype(np.float32)
-            mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
-            g.initializer.append(mk)
-            new_nodes.append(helper.make_node(
-                "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_pert"],
-                name=f"rqsp_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
-            n.input[in_idx] = f"{pname}_pert"
-            promote.append(pname)
-            param_inputs[pname] = numpy_helper.to_array(initmap[pname])
+            yield pname, np.asarray(ent[key], np.float64).reshape(-1), div, nlev, idx, in_idx, n
             idx += 1
 
-    g.node.extend(new_nodes)
-    _promote_initializers_to_inputs(g, promote)
-    _toposort(model)
-    onnx.save(model, out_path)
-    append_cross_entropy_loss(out_path, out_path, label_name=label_name)
-    print(f"  [qzo] int8 zo_train graph (offline weights-as-inputs, {idx} RQSPerturb) -> {out_path}")
+
+def build_qzo_update_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42):
+    """Build the QZO int8 zo_update graph — mirror of `generate_weight_update_graph` for the int8 params.
+
+    Each trainable int8 weight / int32 bias is a graph INPUT; its `RQSPerturbRademacher` result is a graph
+    OUTPUT named `<param>_updated` (BP optimizer-graph in/out contract). Uses the SAME idx/seed/mul as
+    build_qzo_train_graph (via `_iter_qzo_params`), so the update-direction z equals the forward-probe z per
+    param. Returns (out_path, param_inputs).
+    """
+    from onnx4deeploy.transform.qzo_weight_integerize import build_int8_forward
+
+    src, scale_map = build_int8_forward(onnx.load(quant_network_onnx))
+    src_inits = {i.name: i for i in src.graph.initializer}
+    nodes, ginputs, goutputs, inits, param_inputs = [], [], [], [], {}
+
+    for pname, scale, div, nlev, idx, in_idx, _n in _iter_qzo_params(src, scale_map):
+        arr = numpy_helper.to_array(src_inits[pname])
+        param_inputs[pname] = arr
+        ginputs.append(helper.make_tensor_value_info(pname, src_inits[pname].data_type, list(arr.shape)))
+        goutputs.append(helper.make_tensor_value_info(f"{pname}_updated", src_inits[pname].data_type, list(arr.shape)))
+        mul = np.round(eps / scale * div).astype(np.int64).astype(np.float32)
+        mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
+        inits.append(mk)
+        nodes.append(helper.make_node(
+            "RQSPerturbRademacher", [pname, mk.name], [f"{pname}_updated"],
+            name=f"rqsp_upd_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
+
+    graph = helper.make_graph(nodes, "qzo-weight-update", ginputs, goutputs, inits)
+    opset = [helper.make_opsetid("", 13), helper.make_opsetid("mezo", 1)]
+    onnx.save(helper.make_model(graph, producer_name="qzo-weight-update", opset_imports=opset), out_path)
+    print(f"  [qzo] int8 zo_update graph ({len(nodes)} RQSPerturb, params in/updated out) -> {out_path}")
     return out_path, param_inputs
 
 

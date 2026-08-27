@@ -187,6 +187,27 @@ def integerize_perchannel_weights(
     return model, scale_map
 
 
+def _prune_orphans(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Remove nodes whose outputs are consumed by nothing (dead Constants/Casts left by the QCDQ
+    removal) + orphan initializers. Iterate to a fixpoint. Keeps the graph clean for Deeploy."""
+    g = model.graph
+    graph_outs = {o.name for o in g.output}
+    changed = True
+    while changed:
+        used = set(graph_outs)
+        for n in g.node:
+            used.update(n.input)
+        keep = [n for n in g.node if any(o in used for o in n.output) or not n.output]
+        changed = len(keep) != len(g.node)
+        del g.node[:]; g.node.extend(keep)
+    used_inits = set()
+    for n in g.node:
+        used_inits.update(n.input)
+    keep_i = [i for i in g.initializer if i.name in used_inits]
+    del g.initializer[:]; g.initializer.extend(keep_i)
+    return model
+
+
 def _toposort(model: onnx.ModelProto) -> onnx.ModelProto:
     g = model.graph
     have = {i.name for i in g.initializer} | {i.name for i in g.input}
@@ -275,4 +296,4 @@ def build_int8_forward(
     for n in g.node:
         if n.op_type in ("Quant", "Dequant", "RequantShift"):
             n.domain = "ai.onnx.contrib"
-    return _toposort(model), scale_map
+    return _toposort(_prune_orphans(model)), scale_map

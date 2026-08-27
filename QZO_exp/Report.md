@@ -328,3 +328,41 @@ per-channel RequantShift, RQSPerturb, SCE loss — a true extension of the float
    `generate_zo_graph(qzo_model=…)` branch that called `build_qzo_int8_graph`.
 3. Export the **real-data** fixture (fold_3 pretrained, S01/sess3/vocalized) to `QZO_exp/exp2/`.
 4. Then (optional) the TrainDeeploy single-step smoke test.
+
+---
+
+## Iteration 6 — COMPLETE real-data QZO fixture (zo_train + zo_update + L±) (2026-08-27)
+
+### Implemented `build_qzo_update_graph` + `_iter_qzo_params` (shared) + `_prune_orphans`
+- `_iter_qzo_params` yields each Conv/Gemm weight+bias in canonical order (weight-then-bias) with a shared
+  `idx` — used by BOTH train and update so the perturb `z` (seed+idx) matches per param.
+- `build_qzo_update_graph`: params IN → `RQSPerturbRademacher` → `<param>_updated` OUT (mirror of
+  `generate_weight_update_graph`), same mul/idx/seed as train.
+- `_prune_orphans` in `build_int8_forward`: removes the dead `Constant`/`Cast` left by QCDQ removal (56→4,
+  24→0) + orphan initializers → clean graph for Deeploy. Refactored train builder onto `_iter_qzo_params`.
+
+### Generated the real-data fixture → `QZO_exp/exp2/` (`generate_fixture.py`)
+Built from `qinfer/network.onnx` (the **real-data** `-mode quant` export: fold_3 pretrained weights, S01 /
+session 3 / vocalized calibration). L± via building the train graph at `+eps` and `-eps` (same seed → same z,
+opposite sign) = θ±εz:
+- **`network_zo_train.onnx`** — `RQSPerturb×12, Conv×5(int8), RequantShift×6(per-ch), Dequant×5, Relu×5,
+  MaxPool×3, Quant×5, Gemm, Mul(fc dequant), SoftmaxCrossEntropyLoss`; **14 inputs** = `input(i8), label(i64)`
+  + **12 trainable params as INPUTS** (6 weights i8 + 6 biases i32); outputs `loss, log_prob`.
+- **`network_zo_update.onnx`** — `RQSPerturb×12`; 12 params IN → 12 `*_updated` OUT.
+- **`inputs.npz`** — `input(int8,1×1×14×700), label` + 12 int8/int32 params.
+- **`outputs.npz`** — `loss_plus=0.4506, loss_minus=0.3238, grad=(L+-L-)/2ε=6.339, log_prob(1,9)`,
+  `updated_<param>` ×12. `log_prob` argmax 0 == label. **L+ ≠ L−** → real ZO gradient signal.
+
+**DELIVERABLE MET:** a complete, validated, **real-data + pretrained** quantized-ZO fixture with **offline
+int8 weights**, **trainable params (weights+biases) as INPUTS**, per-channel RequantShift, RQSPerturb, SCE
+loss, and host L±/grad reference — a true extension of the float ZO transform machinery
+(`_promote_initializers_to_inputs`, `append_cross_entropy_loss`) and the shipped quantized pipeline
+(`create_quant_pipeline` integer export). Artifacts + `generate_fixture.py` in `QZO_exp/exp2/`.
+
+### Next iteration (7)
+1. **CLI wiring**: route `_export_qzo_training` through `export_quantized` (real SilentWear + `--pretrained-
+   weights`) → `build_qzo_train_graph` + `build_qzo_update_graph`, so `Onnx4Deeploy.py -mode q-zo-train`
+   produces the fixture end-to-end (extension on the CLI, not a script). Comment out the old
+   `generate_zo_graph(qzo_model=…)` branch.
+2. (Optional) TrainDeeploy single-step on-device smoke test: pack the fixture, run
+   `deeployMezoRunner_tiled_siracusa.py` (n_steps 1), compare device L±/grad vs host; verify INT8 conv kernels.

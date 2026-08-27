@@ -82,6 +82,11 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
     g.node.extend(new_nodes)
     _promote_initializers_to_inputs(g, promote)
     _toposort(model)
+    # explicit opset imports: default (SCE), ai.onnx.contrib (Quant/Dequant/RequantShift), mezo (RQSPerturb),
+    # com.microsoft — so ORT shape-inference/TrainDeeploy recognise the custom domains. -- QW
+    del model.opset_import[:]
+    for dom, ver in (("", 13), ("ai.onnx.contrib", 1), ("mezo", 1), ("com.microsoft", 1)):
+        model.opset_import.append(helper.make_opsetid(dom, ver))
     onnx.save(model, out_path)
     append_cross_entropy_loss(out_path, out_path, label_name=label_name)
     print(f"  [qzo] int8 zo_train graph (offline weights-as-inputs, {len(promote)} RQSPerturb) -> {out_path}")

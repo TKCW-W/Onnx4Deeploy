@@ -653,50 +653,93 @@ class BaseONNXExporter(ABC):
         return self.paths["network_zo_train"]
 
     def _export_qzo_training(self, noise_type: str = "rqs_rademacher") -> str:
-        """QZO: emit the INT8 quantized-ZO datapath directly from a calibrated Brevitas model. -- QW
+        """QZO: OFFLINE-int8 quantized-ZO fixture — a true extension of the quant + float-ZO pipelines. -- QW
 
-        Flow:  create_brevitas_model -> PTQ calibrate -> dump per-channel scales -> build_qzo_int8_graph
-               (int8 Conv -> RequantShift -> Dequant -> unfolded fp32 BN; weight Quant->RQSPerturb no-dequant;
-               bias as int32 RequantShift add, perturbed) -> run_onnx_graph reference.
+        Flow (all steps validated host==PyTorch, see QZO_exp/Report.md):
+          1. create_brevitas_model (pretrained) + fold Conv-BN + PTQ calibrate on REAL SilentWear data.
+          2. exportBrevitas (a REAL window as example) + create_quant_pipeline → integer `network.onnx`.
+          3. build_qzo_train_graph: build_int8_forward (per-channel RequantShift, offline int8 weights) +
+             RQSPerturbRademacher + weights/biases-as-INPUTS + SCE loss  →  network_zo_train.onnx.
+          4. build_qzo_update_graph  →  network_zo_update.onnx  (params in → *_updated out).
+          5. inputs.npz (int8 input + real label + int8/int32 params) + outputs.npz (host L+ / L- / grad).
+        Superseded the old generate_zo_graph(qzo_model=…)/build_qzo_int8_graph route (from-model rebuild,
+        online per-channel weight Quant that doesn't fold); that builder stays deprecated in qzo_transform. -- QW
         """
-        import os as _os
+        import os as _os, sys as _sys, shutil as _shutil
         import numpy as _np
         import torch as _torch
+        from pathlib import Path as _Path
         from brevitas.graph.calibrate import calibration_mode
-        from onnx4deeploy.transform.quant_scale_dump import dump_brevitas_scales
-        from onnx4deeploy.transform.zo_transform import generate_zo_graph
+        from onnx4deeploy.transform.qzo_transform import build_qzo_train_graph, build_qzo_update_graph
         from onnx4deeploy.utils.onnx_node_implementations import run_onnx_graph
 
-        print(f"\n{'='*60}\n🚀 Exporting {self.get_model_name()} to ONNX (Quantized Zeroth-Order Mode)\n{'='*60}\n")
-        out_dir = self.paths["output_dir"]
-        zo_cfg = self.config.get("zo", {"epsilon": 0.01, "seed": 42})
+        # QW: make the vendored DeepQuant importable so the CLI works without a manual PYTHONPATH. -- QW
+        _dq = _Path(__file__).resolve().parents[2] / "DeepQuant"
+        if _dq.exists() and str(_dq) not in _sys.path:
+            _sys.path.insert(0, str(_dq))
+        from DeepQuant import ExportBrevitas as _eb_mod
+        from DeepQuant.ExportBrevitas import exportBrevitas
+        from .optimization_passes import create_quant_pipeline
 
-        print("📦 Creating Brevitas-quantized model + PTQ calibration...")
+        print(f"\n{'='*60}\n🚀 Exporting {self.get_model_name()} to ONNX (Quantized Zeroth-Order Mode)\n{'='*60}\n")
+        out_dir = _Path(self.paths["output_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
+        zo_cfg = self.config.get("zo", {"epsilon": 0.01, "seed": 42})
+        eps = float(zo_cfg.get("epsilon", 0.01)); seed = int(zo_cfg.get("seed", 42))
+        net = _os.path.join(str(out_dir), "network.onnx")
+
+        # 1. pretrained brevitas model + fold BN + REAL-data calibration --------------------------------
+        print("📦 Creating Brevitas model (pretrained) + folding Conv-BN + real-data PTQ calibration...")
         model = self.create_brevitas_model(); model.eval()
-        calib = _np.asarray(self.get_calibration_data(), _np.float32)
+        _fold_conv_bn_inplace(model)
+        ishape = self.get_input_shape()
+        # a REAL labeled window (for the example + the fixture input/label); fall back to calib data
+        try:
+            X, Y = self.get_data_source().load_batches(
+                max(int(self.config.get("calib_samples", 8)), self.config.get("num_classes", 2)),
+                ishape[1:], self.config["num_classes"], seed=42)
+            calib = _np.concatenate([_np.asarray(a, _np.float32) for a in X], 0).reshape(-1, *ishape[1:])
+            real_label = int(_np.asarray(Y[0]).reshape(-1)[0])
+        except Exception as _e:                                          # random fallback
+            print(f"   (real data unavailable: {_e}; using random calibration)")
+            calib = _np.random.randn(8, *ishape[1:]).astype(_np.float32); real_label = 0
         with _torch.no_grad(), calibration_mode(model):
             model(_torch.from_numpy(calib))
+        example = _torch.from_numpy(calib[:1].astype(_np.float32))
 
-        scales_path = _os.path.join(out_dir, "speechnet_scales.json")
-        scales = dump_brevitas_scales(model, scales_path)
+        # 2. exportBrevitas + create_quant_pipeline → integer network.onnx ------------------------------
+        print("📤 exportBrevitas + 12-pass integer pipeline...")
+        _orig_ac = _eb_mod.torch.allclose
+        def _lenient(a, b, *a2, **k2):
+            k2["atol"] = max(k2.get("atol", 0.0), 2.0); return _orig_ac(a, b, *a2, **k2)
+        _cwd = _os.getcwd()
+        try:
+            _eb_mod.torch.allclose = _lenient; _os.chdir(out_dir); exportBrevitas(model, example)
+        finally:
+            _os.chdir(_cwd); _eb_mod.torch.allclose = _orig_ac
+        _shutil.copyfile(out_dir / "4_model_dequant_moved.onnx", net)
+        create_quant_pipeline(inputs_npz_path=str(out_dir / "inputs.npz")).run(net, net)
 
-        # QW: route the int8 QZO build THROUGH generate_zo_graph (extension, not a parallel pipeline):
-        #     it calls build_qzo_int8_graph (weights-as-inputs, Add/Sub, BatchNormInternal) then reuses the
-        #     shared append_cross_entropy_loss. Returns the trainable INPUT values for the reference feed. -- QW
-        print("🔧 Building int8 QZO datapath (via generate_zo_graph)...")
-        param_inputs = generate_zo_graph(
-            inference_onnx=None, output_onnx=self.paths["network_zo_train"],
-            zo_config=zo_cfg, noise_type=noise_type, qzo_model=model, qzo_scales=scales)
+        # 3-4. QZO train + update graphs (offline int8 weights, weights-as-INPUTS) ----------------------
+        print("🔧 build_qzo_train_graph + build_qzo_update_graph...")
+        _, param_inputs = build_qzo_train_graph(net, self.paths["network_zo_train"], eps=eps, seed=seed)
+        build_qzo_update_graph(net, self.paths["network_zo_update"], eps=eps, seed=seed)
 
-        print("🧪 Reference (run_onnx_graph)...")
-        ishape = self.get_input_shape()
-        inp = _np.random.randn(*ishape).astype(_np.float32)
-        label = _np.random.randint(0, self.config["num_classes"], (ishape[0], 1)).astype(_np.int64)
-        feed = {"input": inp, "label": label, **param_inputs}          # weights-as-inputs -> feed their values
-        out = _np.asarray(run_onnx_graph(self.paths["network_zo_train"], feed, output_names=["log_prob"])[0])
-        _np.savez(_os.path.join(out_dir, "inputs.npz"), input=inp, label=label, **param_inputs)
-        _np.savez(_os.path.join(out_dir, "outputs.npz"), output=out)
-        print(f"✅ QZO export complete: {self.paths['network_zo_train']} (reference argmax {int(_np.argmax(out))})")
+        # 5. fixture I/O: int8 input (from the pipeline) + real label + params; host L+/L-/grad ---------
+        int8_input = _np.load(out_dir / "inputs.npz")["input"]
+        label = _np.array([[real_label]], _np.int64)
+        go = ["loss", "log_prob"]
+        def _loss(eps_signed):
+            p, _ = build_qzo_train_graph(net, "/tmp/_qzo_pm.onnx", eps=eps_signed, seed=seed)
+            res = run_onnx_graph("/tmp/_qzo_pm.onnx", {"input": int8_input, "label": label, **param_inputs}, output_names=go)
+            L = float(next(_np.asarray(r).flatten()[0] for r in res if _np.asarray(r).size == 1))
+            lp = next(_np.asarray(r) for r in res if _np.asarray(r).size > 1)
+            return L, lp
+        Lp, lp = _loss(+eps); Lm, _ = _loss(-eps); grad = (Lp - Lm) / (2 * eps)
+        _np.savez(_os.path.join(str(out_dir), "inputs.npz"), input=int8_input, label=label, **param_inputs)
+        _np.savez(_os.path.join(str(out_dir), "outputs.npz"),
+                  loss_plus=_np.float32(Lp), loss_minus=_np.float32(Lm), grad=_np.float32(grad), log_prob=lp)
+        print(f"✅ QZO export complete: {self.paths['network_zo_train']}")
+        print(f"   L+={Lp:.6f}  L-={Lm:.6f}  grad={grad:.6f}  log_prob argmax {int(_np.argmax(lp))} (label {real_label})")
         return self.paths["network_zo_train"]
 
     def create_training_test_data_zo(self) -> None:

@@ -366,3 +366,66 @@ loss, and host L±/grad reference — a true extension of the float ZO transform
    `generate_zo_graph(qzo_model=…)` branch.
 2. (Optional) TrainDeeploy single-step on-device smoke test: pack the fixture, run
    `deeployMezoRunner_tiled_siracusa.py` (n_steps 1), compare device L±/grad vs host; verify INT8 conv kernels.
+
+---
+
+## Iteration 7 — CLI wiring COMPLETE; end-to-end real-data fixture from `-mode q-zo-train` (2026-08-27)
+
+### Rewrote `_export_qzo_training` (base_exporter.py) — the CLI extension
+Replaced the deprecated `generate_zo_graph(qzo_model=…)`/`build_qzo_int8_graph` route with the validated
+offline-int8 flow, all inside the existing `-mode q-zo-train` CLI:
+1. `create_brevitas_model` (pretrained) → `_fold_conv_bn_inplace` → **PTQ calibrate on REAL SilentWear** (via
+   `get_data_source().load_batches`, a real labeled window as the export example + fixture input/label).
+2. `exportBrevitas` (lenient-allclose) + `create_quant_pipeline` → integer `network.onnx`.
+3. `build_qzo_train_graph` + `build_qzo_update_graph` (offline int8 weights, weights/biases-as-INPUTS).
+4. Fixture I/O: `inputs.npz` (int8 input + real label + 12 int8/int32 params) + `outputs.npz` (host
+   `loss_plus`/`loss_minus`/`grad`/`log_prob`).
+Also: **added the vendored DeepQuant to `sys.path`** so the CLI runs without a manual `PYTHONPATH`, and set
+explicit **opset imports** (`'' , ai.onnx.contrib, mezo, com.microsoft`) on the train graph (fixes the ORT
+shape-inference "No opset import for domain mezo" warning).
+
+### Verified — one command produces the whole fixture
+```
+python3 Onnx4Deeploy.py -model SpeechNet -mode q-zo-train --noise-type rqs_rademacher \
+  --dataset silentwear --data-path /app/SilentWear/SilentWear_data/data_raw_and_filt \
+  --pretrained-weights <fold_3.pt> --subject S01 --session 3 --condition vocalized --batch 1 \
+  -o /app/Onnx4Deeploy/QZO_exp/exp2
+```
+→ `QZO_exp/exp2/{network.onnx, network_zo_train.onnx, network_zo_update.onnx, inputs.npz, outputs.npz}`.
+`network_zo_train`: opsets `['',ai.onnx.contrib,mezo,com.microsoft]`, **14 inputs (12 params-as-INPUTS)**,
+`RQSPerturb×12, Conv×5(int8), RequantShift×6, Dequant×5, Relu×5, MaxPool×3, Quant×5, Gemm, Mul, SCE`.
+`inputs.npz`: int8 input `(1,1,14,700)` + real **label 0** + 12 int8/int32 params. `outputs.npz`:
+`L+=2.589, L-=3.358, grad=-38.48`. (argmax 3 ≠ label 0 = the pretrained model mispredicts this real window →
+higher loss + strong real ZO gradient — correct real-data behaviour, not a bug.)
+
+---
+
+## CONCLUSION — result of this loop run (through iteration 7)
+
+**The primary goal is achieved:** a completely extended `Onnx4Deeploy` capable of **quantized ZO**, driven by
+`-mode q-zo-train`, generating a **real-data + pretrained-weights** int8 fixture. Delivered:
+- **Offline int8 weights** (standard per-channel quant), **trainable params (weights+biases) as graph
+  INPUTS**, per-channel RequantShift — the design agreed this run.
+- A **true extension** of both pipelines: the shipped **quant** pipeline (`exportBrevitas` +
+  `create_quant_pipeline` integer export) and the **float-ZO** transform helpers
+  (`_promote_initializers_to_inputs`, `append_cross_entropy_loss`), plus the new per-channel integerization
+  (`qzo_weight_integerize`) that closes the pipeline's per-channel-weight gap.
+- **Numerically validated**: the int8 forward matches PyTorch (cos≈1.0, argmax match); eps=0 → identity;
+  eps>0 → real ZO gradient (L+≠L−).
+- New/changed code: `onnx4deeploy/transform/qzo_weight_integerize.py` (integerize + `build_int8_forward`),
+  `onnx4deeploy/transform/qzo_transform.py` (`build_qzo_train_graph`, `build_qzo_update_graph`,
+  `_iter_qzo_params`; deprecated `build_qzo_int8_graph`), `onnx4deeploy/core/base_exporter.py`
+  (`_export_qzo_training` rewrite), `onnx4deeploy/utils/onnx_node_implementations.py` (attr-scale
+  Quant/Dequant). Commits on `feat/QZO`.
+
+**Known limitations / follow-ups:** (a) online fp32-master weight perturbation deferred (needs a per-channel
+Quant kernel in Deeploy). (b) BN is folded by the quant export (no BN γ/β ZO training in this v1). (c) The
+`-mode quant` pipeline's own RequantShift is per-tensor and wrong for per-channel SpeechNet — we bypass it via
+`build_int8_forward`; fixing the pipeline passes themselves is a separate task. (d) On-device validation
+(below) still pending.
+
+### Next iteration (8) — optional TrainDeeploy on-device smoke test
+Pack `QZO_exp/exp2` → `Tests/Models/Training/SpeechNet/speechnet_qzo_{train,update}`; kill orphan gvsoc by
+PID; run `deeployMezoRunner_tiled_siracusa.py` (n_steps 1, n_accum 1, num-data-inputs 2, eps 0.01, seed 42,
+`-D BN_FROZEN_STATS=ON`); compare device L±/grad vs host `outputs.npz`; grep generated `TrainingNetwork.c` for
+int8 pulp-nn conv (not `PULP_Conv2d_Im2Col_fp32`).

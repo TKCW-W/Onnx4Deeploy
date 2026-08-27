@@ -548,6 +548,9 @@ class BaseONNXExporter(ABC):
         self.config = self.load_config()
         self.paths = self.setup_paths(ExportMode.ZO_TRAINING)
 
+        if quant:                       # QZO: int8 quantized-ZO datapath (see _export_qzo_training) -- QW
+            return self._export_qzo_training(noise_type)
+
         print(f"\n{'='*60}")
         print(f"🚀 Exporting {self.get_model_name()} to ONNX (Zeroth-Order Training Mode)")
         print(f"{'='*60}\n")
@@ -647,6 +650,48 @@ class BaseONNXExporter(ABC):
         print(f"   zo_train : {self.paths['network_zo_train']}")
         print(f"   zo_update: {self.paths['network_zo_update']}")
         print(f"{'='*60}\n")
+        return self.paths["network_zo_train"]
+
+    def _export_qzo_training(self, noise_type: str = "rqs_rademacher") -> str:
+        """QZO: emit the INT8 quantized-ZO datapath directly from a calibrated Brevitas model. -- QW
+
+        Flow:  create_brevitas_model -> PTQ calibrate -> dump per-channel scales -> build_qzo_int8_graph
+               (int8 Conv -> RequantShift -> Dequant -> unfolded fp32 BN; weight Quant->RQSPerturb no-dequant;
+               bias as int32 RequantShift add, perturbed) -> run_onnx_graph reference.
+        """
+        import os as _os
+        import numpy as _np
+        import torch as _torch
+        from brevitas.graph.calibrate import calibration_mode
+        from onnx4deeploy.transform.quant_scale_dump import dump_brevitas_scales
+        from onnx4deeploy.transform.qzo_transform import build_qzo_int8_graph
+        from onnx4deeploy.utils.onnx_node_implementations import run_onnx_graph
+
+        print(f"\n{'='*60}\n🚀 Exporting {self.get_model_name()} to ONNX (Quantized Zeroth-Order Mode)\n{'='*60}\n")
+        out_dir = self.paths["output_dir"]
+        zo_cfg = self.config.get("zo", {"epsilon": 0.01, "seed": 42})
+
+        print("📦 Creating Brevitas-quantized model + PTQ calibration...")
+        model = self.create_brevitas_model(); model.eval()
+        calib = _np.asarray(self.get_calibration_data(), _np.float32)
+        with _torch.no_grad(), calibration_mode(model):
+            model(_torch.from_numpy(calib))
+
+        scales_path = _os.path.join(out_dir, "speechnet_scales.json")
+        scales = dump_brevitas_scales(model, scales_path)
+
+        print("🔧 Building int8 QZO datapath...")
+        build_qzo_int8_graph(model, scales, self.paths["network_zo_train"],
+                             eps=float(zo_cfg.get("epsilon", 0.01)), seed=int(zo_cfg.get("seed", 42)))
+
+        print("🧪 Reference (run_onnx_graph)...")
+        ishape = self.get_input_shape()
+        inp = _np.random.randn(*ishape).astype(_np.float32)
+        label = _np.random.randint(0, self.config["num_classes"], (ishape[0], 1)).astype(_np.int64)
+        out = _np.asarray(run_onnx_graph(self.paths["network_zo_train"], {"input": inp, "label": label}))
+        _np.savez(_os.path.join(out_dir, "inputs.npz"), input=inp, label=label)
+        _np.savez(_os.path.join(out_dir, "outputs.npz"), output=out)
+        print(f"✅ QZO export complete: {self.paths['network_zo_train']} (reference argmax {int(_np.argmax(out))})")
         return self.paths["network_zo_train"]
 
     def create_training_test_data_zo(self) -> None:

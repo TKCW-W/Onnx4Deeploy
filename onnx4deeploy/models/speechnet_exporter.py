@@ -122,6 +122,52 @@ class SpeechNetExporter(BaseONNXExporter):
             blk[1] = nn.Identity()
         return model
 
+    def create_brevitas_model(self) -> torch.nn.Module:
+        """QZO: INT8 Brevitas SpeechNet (conv+fc int8, BN unfolded fp32). Used by -mode q-zo-train."""
+        import os
+        from .pytorch_models.speechnet.speechnet_quant import QuantSpeechNetDeploy
+        model = QuantSpeechNetDeploy(
+            num_channels=self.model_config["num_channels"],
+            time_steps=self.model_config["time_steps"],
+            num_classes=self.model_config["num_classes"],
+        )
+        ckpt = self.model_config.get("pretrained_weights")
+        if ckpt and os.path.exists(ckpt):
+            sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+            if isinstance(sd, dict):
+                sd = sd.get(self.model_config.get("pretrained_key"), sd)
+            remap = {}
+            for k, v in sd.items():                     # SpeechNetDeploy blocks.N.0=conv/.1=bn -> .conv/.bn
+                p = k.split(".")
+                if k.startswith("blocks.") and len(p) >= 4 and p[2] in ("0", "1"):
+                    remap[f"blocks.{p[1]}.{'conv' if p[2]=='0' else 'bn'}." + ".".join(p[3:])] = v
+                else:
+                    remap[k] = v
+            missing, unexpected = model.load_state_dict(remap, strict=False)
+            print(f"  QuantSpeechNet: loaded pretrained (remapped); missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            for n, param in model.named_parameters():
+                if "weight" in n and param.dim() > 1:
+                    torch.nn.init.normal_(param, 0.0, 0.05)
+                if "bias" in n:
+                    torch.nn.init.uniform_(param, 0.01, 0.02)
+            print("  QuantSpeechNet: no pretrained_weights -> random init")
+        return model
+
+    def get_calibration_data(self):
+        """Representative windows for PTQ activation-scale calibration (real SilentWear if available)."""
+        import numpy as np
+        n = int(self.config.get("calib_samples", 8))
+        shape = (n, 1, self.model_config["num_channels"], self.model_config["time_steps"])
+        if self.config.get("dataset", "random") == "silentwear":
+            try:
+                ds = self.get_data_source()
+                X, _ = ds.load_batches(n, shape[1:], self.model_config["num_classes"], seed=42)
+                return np.asarray(X[:n], np.float32).reshape(shape)
+            except Exception as e:
+                print(f"  calibration: silentwear unavailable ({e}); using random")
+        return np.random.randn(*shape).astype(np.float32)
+
     # ------------------------------------------------------------------ #
     # Shape helpers                                                        #
     # ------------------------------------------------------------------ #

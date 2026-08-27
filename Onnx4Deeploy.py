@@ -529,6 +529,9 @@ def generate_model(
         elif mode == "zo-train":  # QW: zeroth-order (MeZO) training export -- QW
             onnx_file = exporter.export_zo_training(noise_type=noise_type)
             mode_desc = "Zeroth-order (MeZO) training mode"
+        elif mode == "q-zo-train":  # QW: quantized (int8) zeroth-order training export -- QW
+            onnx_file = exporter.export_zo_training(noise_type=noise_type, quant=True)
+            mode_desc = "Quantized zeroth-order (QZO) training mode"
         else:
             print(f"❌ Unknown mode: {mode}")
             print("   Available modes: infer, train, train_single_step, quant")
@@ -654,7 +657,7 @@ Examples:
         "-mode",
         "--mode",
         type=str,
-        choices=["infer", "train", "train_single_step", "quant", "zo-train"],
+        choices=["infer", "train", "train_single_step", "quant", "zo-train", "q-zo-train"],
         default="infer",
         help="Model export mode: infer (FP32 inference), train (training), "
         "train_single_step (training graph wired up for inference-runner-style "

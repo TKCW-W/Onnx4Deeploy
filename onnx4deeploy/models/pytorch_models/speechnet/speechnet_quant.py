@@ -77,9 +77,8 @@ class QuantSpeechNetDeploy(nn.Module):
         self.time_steps = time_steps
         self.num_classes = num_classes
 
-        # Input quantiser: raw fp32 window -> int8.
-        self.input_quant = qnn.QuantIdentity(act_quant=Int8ActPerTensorFloat, return_quant_tensor=True)
-
+        # NOTE: no standalone input QuantIdentity — block 0's QuantConv2d.input_quant already quantises the
+        # raw window, so the input is quantised exactly ONCE (avoids the redundant double input-quant).
         self.blocks = nn.ModuleList()
         in_ch = 1
         for out_ch, kernel, pool in _BLOCKS:
@@ -97,8 +96,7 @@ class QuantSpeechNetDeploy(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_quant(x)
-        for block in self.blocks:
+        for block in self.blocks:            # block 0's conv.input_quant quantises the raw input
             x = block(x)
         x = self.global_pool(x)
         x = x.reshape(x.shape[0], self._fc_in)

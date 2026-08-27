@@ -1,148 +1,164 @@
 # Copyright ETH Zurich 2026
 # SPDX-License-Identifier: Apache-2.0
 """
-Quantized ZO (QZO) graph transform — online weight quantisation + int8 Rademacher perturbation.
+Quantized ZO (QZO) int8 datapath builder for SpeechNet.
 
-Design (feat/QZO, QZO_exp/exp1): for each Conv/Gemm, replace the weight path
-    W_fp32(grid) → Conv
-with
-    W_fp32(grid) → Quant(scale) → RQSPerturbRademacher(mul) → Dequant(scale) → Conv
-so that:
-  * the perturbation lands on the **int8 code** (correct int-domain ε·z, via RQSPerturbRademacher), and
-  * the **conv still sees fp32** (numerically consistent with the QCDQ base — no requant surgery needed here),
-  * Deeploy's frontend later folds `weight-Quant → … → Conv → RequantShift` into a true int8 `RequantizedConv`.
+Emits the TRUE int8 datapath (not QCDQ-on-fp32) directly from a calibrated QuantSpeechNet + its scales:
 
-`Quant`/`Dequant` are emitted **decomposed** (Div→Round→Clip / Sub→Mul) so Deeploy's QuantPatternPass /
-DequantPatternPass recognise them. The per-channel weight scale comes from the scales JSON (single source of
-truth), and the RQSPerturb `mul = round(eps/scale · 2**15)` is computed from the *same* scale.
+  per conv block:
+     a_int8 → Conv(int8 act, int8 weight) → RequantShift(int32→int8, per-ch mul, int32 add) → Dequant(s_out)
+              → BatchNormalization(fp32, unfolded) → ReLU → MaxPool → Quant(s_in_next) → a_int8_next
+     weight:  W_fp32 → Quant(s_w, per-ch) → RQSPerturbRademacher → int8 → Conv          (NO weight dequant)
+     bias:    add = round(bias/s_out · div)  (int32, the RequantShift 3rd input) → RQSPerturbRademacher(int32)
 
-Only Conv/Gemm **weights** (and, optionally, biases) are quantised+perturbed here; BN stays fp32 (handled
-elsewhere / float-perturbed). A SoftmaxCrossEntropyLoss is appended to produce the ZO training loss.
+  head:  GAP → Quant(s_in_fc) → Gemm(int8) + int32 bias(perturbed) → per-class dequant → fp32 logits
+  loss:  SoftmaxCrossEntropyLoss(logits, label) → log_prob
+
+Scales come from the scales JSON (single source of truth): mul[c] = round(s_in·s_w[c]/s_out · div),
+RQSPerturb weight mul = round(ε/s_w · 2¹⁵), bias mul = round(ε·div/s_out · 2¹⁵).
+Quant is emitted decomposed (Div→Round→Clip) and activation Dequant per-tensor (Mul) so Deeploy folds them;
+Conv→RequantShift folds to RequantizedConv. All int tensors are fp32-valued integers (QCDQ convention that
+run_onnx_graph executes).
 """
-import json
-import os
-from typing import Dict, List, Optional
-
 import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-
-DIV_RQS = 2 ** 15   # RQSPerturb fixed-point divisor (matches shipped kernel)
-
-
-def _load_scales(scales_path: Optional[str]) -> Dict[str, list]:
-    if scales_path and os.path.exists(scales_path):
-        with open(scales_path) as f:
-            return json.load(f)
-    return {}
+DIV_CONV = 2 ** 16     # RequantShift shift for convs (mul fits int, x*mul stays in int32)
+DIV_PERT = 2 ** 15     # RQSPerturb fixed-point divisor
 
 
-def _weight_scale_for(node_name: str, weight_name: str, out_ch: int, scales: Dict[str, list]) -> np.ndarray:
-    """Per-channel weight scale [out_ch] from the JSON; fallback 1/127 if not found."""
-    # keys look like "blocks.0.conv.weight_quant" / "fc.weight_quant"
-    for key, val in scales.items():
-        if key.endswith(".weight_quant"):
-            arr = np.asarray(val, dtype=np.float64).flatten()
-            if arr.shape[0] == out_ch:
-                # prefer an ordered match by consuming keys once; simple channel-count match is enough
-                return arr
-    return np.ones(out_ch, dtype=np.float64) / 127.0
+def _np(x):
+    return x.detach().cpu().float().numpy()
 
 
-def _quantize_perturb_weight(nodes, inits, value_info, w_name, w_arr, scale, eps, seed, idx):
-    """Emit  W → Div → Round → Clip → RQSPerturb → Sub(0) → Mul  and return the final (perturbed fp32) name."""
-    C = w_arr.shape[0]
-    rank = w_arr.ndim
-    bshape = [C] + [1] * (rank - 1)                        # broadcast scale over output channels
-    s_b = scale.reshape(bshape).astype(np.float32)
-    s_flat = scale.astype(np.float64)
+def build_qzo_int8_graph(model, scales, out_path, eps=0.01, seed=42, label_name="label"):
+    """Construct the int8 QZO train graph from a calibrated QuantSpeechNet + scales dict. Returns out_path."""
+    model.eval()
+    nodes, inits, vinfo = [], [], []
+    pcount = [0]
 
-    def add_init(name, arr):
+    def K(name, arr):
         inits.append(numpy_helper.from_array(np.asarray(arr), name)); return name
 
-    scale_i = add_init(f"{w_name}_qs", s_b)                # per-channel scale
-    cmin = add_init(f"{w_name}_cmin", np.array(-128.0, np.float32))
-    cmax = add_init(f"{w_name}_cmax", np.array(127.0, np.float32))
-    zp = add_init(f"{w_name}_zp", np.array(0.0, np.float32))
-    mul = np.round(eps / s_flat * DIV_RQS).astype(np.int64)
-    mul_i = add_init(f"{w_name}_mul", mul.astype(np.float32))    # RQSPerturb mul (per-channel)
+    def quant_act(x, s, tag):
+        """fp32 x → int8 (Div s → Round → Clip[-128,127]); per-tensor scalar s."""
+        d, r, c = f"{tag}_qd", f"{tag}_qr", f"{tag}_q8"
+        nodes.append(helper.make_node("Div", [x, K(f"{tag}_s", np.array(s, np.float32))], [d]))
+        nodes.append(helper.make_node("Round", [d], [r]))
+        nodes.append(helper.make_node("Clip", [r, K(f"{tag}_lo", np.array(-128., np.float32)),
+                                               K(f"{tag}_hi", np.array(127., np.float32))], [c]))
+        return c
 
-    d, r, c, p, sub, o = (f"{w_name}_{s}" for s in ("qdiv", "qrnd", "qclip", "qpert", "qdsub", "qdeq"))
-    nodes += [
-        helper.make_node("Div",   [w_name, scale_i], [d], name=f"qzo_qdiv_{idx}"),
-        helper.make_node("Round", [d], [r], name=f"qzo_qrnd_{idx}"),
-        helper.make_node("Clip",  [r, cmin, cmax], [c], name=f"qzo_qclip_{idx}"),
-        helper.make_node("RQSPerturbRademacher", [c, mul_i], [p], name=f"qzo_pert_{idx}",
-                         domain="mezo", idx=idx, seed=seed, signed=1, div=DIV_RQS, n_levels=256,
-                         doc_string="y = x + eps * RQSRademacher(x)"),
-        helper.make_node("Sub",   [p, zp], [sub], name=f"qzo_ddsub_{idx}"),   # Dequant (zp=0)
-        helper.make_node("Mul",   [sub, scale_i], [o], name=f"qzo_ddmul_{idx}"),
-    ]
-    value_info.append(helper.make_tensor_value_info(o, TensorProto.FLOAT, list(w_arr.shape)))
-    return o
+    def quant_perturb_weight(W, s_w, tag):
+        """W_fp32(init) → Div(per-ch s_w) → Round → Clip → RQSPerturb → int8 code (fp32-valued)."""
+        C = W.shape[0]
+        s_b = s_w.reshape([C] + [1] * (W.ndim - 1)).astype(np.float32)
+        wname = K(f"{tag}_W", W.astype(np.float32))
+        d, r, c, p = f"{tag}_wd", f"{tag}_wr", f"{tag}_w8", f"{tag}_wp"
+        nodes.append(helper.make_node("Div", [wname, K(f"{tag}_ws", s_b)], [d]))
+        nodes.append(helper.make_node("Round", [d], [r]))
+        nodes.append(helper.make_node("Clip", [r, K(f"{tag}_wlo", np.array(-128., np.float32)),
+                                               K(f"{tag}_whi", np.array(127., np.float32))], [c]))
+        wmul = np.round(eps / s_w * DIV_PERT).astype(np.int64).astype(np.float32)
+        nodes.append(helper.make_node("RQSPerturbRademacher", [c, K(f"{tag}_wmul", wmul)], [p],
+                     name=f"rqs_w_{tag}", domain="mezo", idx=pcount[0], seed=seed, signed=1,
+                     div=DIV_PERT, n_levels=256))
+        pcount[0] += 1
+        return p
 
+    def perturb_bias_i32(bias, s_out, div, tag):
+        """add[c] = round(bias/s_out · div) int32, perturbed by its own int32 RQSPerturb."""
+        add = np.round(bias / s_out * div).astype(np.int64).astype(np.float32)
+        bmul = np.round(eps * div / s_out * DIV_PERT).astype(np.int64).astype(np.float32)
+        p = f"{tag}_bp"
+        nodes.append(helper.make_node("RQSPerturbRademacher", [K(f"{tag}_add", add), K(f"{tag}_bmul", bmul)], [p],
+                     name=f"rqs_b_{tag}", domain="mezo", idx=pcount[0], seed=seed, signed=1,
+                     div=2 ** 31, n_levels=2 ** 32))
+        pcount[0] += 1
+        return p
 
-def generate_qzo_train_graph(inference_onnx: str, output_onnx: str, zo_config: dict,
-                             scales_path: Optional[str] = None, label_name: str = "label",
-                             perturb_bias: bool = False) -> str:
-    """Build the QZO train graph from the QCDQ base: online weight-quant + int8 perturb + SCE loss."""
-    eps = float(zo_config.get("epsilon", 0.01))
-    seed = int(zo_config.get("seed", 42))
-    scales = _load_scales(scales_path)
-
-    model = onnx.load(inference_onnx)
-    g = model.graph
-    inits = list(g.initializer)
-    init_by_name = {i.name: numpy_helper.to_array(i) for i in inits}
-    value_info = list(g.value_info)
-    new_nodes: List = []
-    idx = 0
-
-    for node in g.node:
-        if node.op_type in ("Conv", "Gemm") and len(node.input) >= 2:
-            new_inputs = list(node.input)
-            for i, inp in enumerate(node.input):
-                is_w = inp in init_by_name and ("weight" in inp.lower() or (i == 1))
-                is_b = inp in init_by_name and ("bias" in inp.lower() or (i == 2))
-                if is_w:
-                    w = init_by_name[inp]; C = w.shape[0]
-                    s = _weight_scale_for(node.name, inp, C, scales)
-                    new_inputs[i] = _quantize_perturb_weight(new_nodes, inits, value_info, inp, w, s, eps, seed, idx)
-                    idx += 1
-                elif is_b and perturb_bias:
-                    pass  # bias perturbation: follow-up (int32 path); kept fp32 for exp1
-            nn = helper.make_node(node.op_type, new_inputs, list(node.output), name=node.name,
-                                  **{a.name: helper.get_attribute_value(a) for a in node.attribute})
-            new_nodes.append(nn)
+    a = "input"
+    for bi, block in enumerate(model.blocks):
+        conv, bn = block.conv, block.bn
+        tag = f"b{bi}"
+        s_in = float(scales[f"blocks.{bi}.conv.input_quant"])
+        s_out = float(scales[f"blocks.{bi}.conv.output_quant"])
+        s_w = np.asarray(scales[f"blocks.{bi}.conv.weight_quant"], np.float64)
+        W = _np(conv.weight); bias = _np(conv.bias)
+        Cout = W.shape[0]
+        # activation quant
+        a8 = quant_act(a, s_in, f"{tag}_ain")
+        # weight quant+perturb
+        Wp = quant_perturb_weight(W, s_w, tag)
+        # int8 conv (fp32-valued int), no bias in the conv (bias goes into the requant add)
+        conv_out = f"{tag}_conv"
+        katt = dict(dilations=list(conv.dilation), group=conv.groups,
+                    kernel_shape=list(conv.kernel_size), pads=list(conv.padding) * 2, strides=list(conv.stride))
+        nodes.append(helper.make_node("Conv", [a8, Wp], [conv_out], name=f"conv_{tag}", **katt))
+        # requant: mul = round(s_in·s_w/s_out · div), add = perturbed int32 bias
+        mul = np.round(s_in * s_w / s_out * DIV_CONV).astype(np.int64).astype(np.float32)
+        add_p = perturb_bias_i32(bias, s_out, DIV_CONV, tag)
+        o8 = f"{tag}_o8"
+        nodes.append(helper.make_node("RequantShift", [conv_out, K(f"{tag}_mul", mul), add_p], [o8],
+                     name=f"rqs_{tag}", domain="ai.onnx.contrib", div=DIV_CONV, n_levels=256, signed=1))
+        # dequant (per-tensor s_out) → fp32 for BN
+        odq = f"{tag}_odq"
+        nodes.append(helper.make_node("Mul", [o8, K(f"{tag}_sout", np.array(s_out, np.float32))], [odq]))
+        # unfolded fp32 BN
+        bn_o = f"{tag}_bn"
+        nodes.append(helper.make_node("BatchNormalization",
+                     [odq, K(f"{tag}_g", _np(bn.weight)), K(f"{tag}_be", _np(bn.bias)),
+                      K(f"{tag}_m", _np(bn.running_mean)), K(f"{tag}_v", _np(bn.running_var))],
+                     [bn_o], epsilon=float(bn.eps)))
+        relu_o = f"{tag}_relu"
+        nodes.append(helper.make_node("Relu", [bn_o], [relu_o]))
+        if isinstance(block.pool, type(model.blocks[0].pool)) and hasattr(block.pool, "kernel_size"):
+            po = f"{tag}_pool"
+            nodes.append(helper.make_node("MaxPool", [relu_o], [po],
+                         kernel_shape=list(block.pool.kernel_size), strides=list(block.pool.stride)))
+            a = po
         else:
-            new_nodes.append(node)
+            a = relu_o
 
-    # rebuild graph with the perturbed weight branches
-    ng = helper.make_graph(new_nodes, g.name + "-qzo", list(g.input), list(g.output), inits, value_info=value_info)
-    std = next((op.version for op in model.opset_import if op.domain == ""), 17)
-    opset = [helper.make_opsetid("", std), helper.make_opsetid("mezo", 1), helper.make_opsetid("ai.onnx.contrib", 1)]
-    nm = helper.make_model(ng, producer_name="qzo-train", opset_imports=opset)
-    onnx.save(nm, output_onnx)
+    # head: GAP → int8 → Gemm(int8) + int32 bias → per-class dequant → fp32 logits
+    gap = "gap"
+    nodes.append(helper.make_node("GlobalAveragePool", [a], [gap]))
+    flat = "flat"
+    nodes.append(helper.make_node("Reshape", [gap, K("flat_shape", np.array([1, model._fc_in], np.int64))], [flat]))
+    s_in_fc = float(scales["fc.input_quant"]); s_w_fc = np.asarray(scales["fc.weight_quant"], np.float64)
+    fc_in8 = quant_act(flat, s_in_fc, "fc_in")
+    Wfc = _np(model.fc.weight)                       # [num_classes, fc_in]
+    Wfc_p = quant_perturb_weight(Wfc, s_w_fc, "fc")
+    gemm = "gemm"
+    nodes.append(helper.make_node("Gemm", [fc_in8, Wfc_p], [gemm], transB=1))   # int8 gemm, no bias here
+    # bias in accumulator domain (s_in_fc·s_w_fc), perturbed int32
+    bias_fc = _np(model.fc.bias)
+    s_bias = s_in_fc * s_w_fc
+    add_fc = np.round(bias_fc / s_bias).astype(np.int64).astype(np.float32)
+    bmul_fc = np.round(eps / s_bias * DIV_PERT).astype(np.int64).astype(np.float32)
+    bp = "fc_bp"
+    nodes.append(helper.make_node("RQSPerturbRademacher", [K("fc_addv", add_fc), K("fc_bmul", bmul_fc)], [bp],
+                 name="rqs_b_fc", domain="mezo", idx=pcount[0], seed=seed, signed=1, div=2 ** 31, n_levels=2 ** 32))
+    pcount[0] += 1
+    summ = "fc_sum"
+    nodes.append(helper.make_node("Add", [gemm, bp], [summ]))
+    logits = "output"
+    dqmul = (s_in_fc * s_w_fc).astype(np.float32)     # per-class dequant to fp32 logits
+    nodes.append(helper.make_node("Mul", [summ, K("fc_dqmul", dqmul)], [logits]))
 
-    # append SoftmaxCrossEntropyLoss(logits, label) -> log_prob
-    _append_ce_loss(output_onnx, output_onnx, label_name)
-    print(f"  [qzo] wrote train graph -> {output_onnx}  ({idx} weights quantised+perturbed)")
-    return output_onnx
+    # loss
+    nodes.append(helper.make_node("SoftmaxCrossEntropyLoss", [logits, label_name], ["log_prob"],
+                 name="CrossEntropyLoss", reduction="mean"))
 
-
-def _append_ce_loss(onnx_path, out_path, label_name="label"):
-    m = onnx.load(onnx_path); g = m.graph
-    logits = g.output[0].name
-    bdim = g.input[0].type.tensor_type.shape.dim[0]
-    batch = bdim.dim_value if bdim.HasField("dim_value") else 1
-    g.input.append(helper.make_tensor_value_info(label_name, TensorProto.INT64, [batch, 1]))
-    g.node.append(helper.make_node("SoftmaxCrossEntropyLoss", [logits, label_name], ["log_prob"],
-                                   name="CrossEntropyLoss", reduction="mean"))
-    oshape = [d.dim_value if d.HasField("dim_value") else 1 for d in g.output[0].type.tensor_type.shape.dim]
-    del g.output[:]
-    g.output.append(helper.make_tensor_value_info("log_prob", TensorProto.FLOAT, oshape))
-    try:
-        onnx.save(onnx.shape_inference.infer_shapes(m), out_path)
-    except Exception:
-        onnx.save(m, out_path)
+    graph = helper.make_graph(
+        nodes, "speechnet-qzo-int8",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, model.num_channels, model.time_steps]),
+         helper.make_tensor_value_info(label_name, TensorProto.INT64, [1, 1])],
+        [helper.make_tensor_value_info("log_prob", TensorProto.FLOAT, [1, model.num_classes])],
+        inits)
+    opset = [helper.make_opsetid("", 13), helper.make_opsetid("mezo", 1), helper.make_opsetid("ai.onnx.contrib", 1)]
+    m = helper.make_model(graph, producer_name="qzo-int8", opset_imports=opset)
+    onnx.save(m, out_path)
+    print(f"  [qzo] int8 datapath -> {out_path}  ({pcount[0]} RQSPerturb nodes)")
+    return out_path

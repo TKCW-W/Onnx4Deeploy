@@ -560,3 +560,21 @@ RQSPerturbRademacher port (5e786aa, 967dba5, 8a853ce) + merge guard (ee569cf). F
 `RequantizedConv` — extend `ConvChecker` to infer levels/signedness through a variable int8 weight (mirror the
 `RQSPerturbZOChecker` nLevels fallback) and relax the conv tile-constraint to admit a non-constant weight
 buffer; then finish codegen → GVSoC sim → compare device L±/grad vs host `outputs.npz`.
+
+---
+
+## Iteration 11 — one focused ConvChecker attempt; loop wind-down (2026-08-27)
+
+Applied the anticipated fix: `ConvChecker._inferNumLevels` now falls back to `2^typeWidth` when the conv
+weight's `nLevels` is `None` (TrainDeeploy commit — the runtime-perturbed weight inherits `nLevels=None` from
+the promoted graph-input weight). **Necessary but not sufficient:** codegen still exhausts backtracking at the
+same `RequantizedConv` node. The tile-constraint reads only weight *dims* (not values), so the remaining
+rejection is deeper in the int8-conv binding/lowering path and opaque ("exhausted backtracking" with no single
+line). This confirms the blocker is the **multi-layer Deeploy runtime-weight-int8-conv sub-project** (type
+inference + binding + template), not a one-line fix — exactly the boundary flagged in iteration 10.
+
+**Loop decision:** the **primary goal is complete and validated**; the optional device smoke test is advanced
+to a well-characterized, deep Deeploy limitation with a concrete recommended path (above). Per plan (one
+focused attempt at the next layer, then stop rather than autonomously grind a research-scale Deeploy sub-task),
+**this /loop run is concluded here.** Everything is committed and documented; resuming the device work is a
+deliberate, scoped follow-up the user can opt into. See the CONCLUSION section above for the full result.

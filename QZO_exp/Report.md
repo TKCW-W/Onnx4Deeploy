@@ -184,3 +184,70 @@ validation are the next step, below).
    initializers_to_inputs` (weights-as-INPUTS) + `append_cross_entropy_loss` → `network_zo_train.onnx`;
    `generate_weight_update_graph` → `network_zo_update.onnx`; wire `_export_qzo_training` (comment out
    `build_qzo_int8_graph`); export real-data fixture to `QZO_exp/exp2/`.
+
+---
+
+## Iteration 3 — establish the host reference; find the -mode quant graph is not integer-correct (2026-08-27)
+
+### Reference-runner fixes (reusable, committed)
+To run pipeline-produced graphs through `run_onnx_graph` I fixed three real gaps:
+- **Toposort:** `create_quant_pipeline` output nodes are unordered → `run_onnx_graph` KeyErrors on a
+  not-yet-produced input. Added a toposort in the harness.
+- **Domain:** the pipeline emits `Quant/Dequant/RequantShift` in the DEFAULT domain, but `run_onnx_graph`
+  routes Deeploy ops by `ai.onnx.contrib`. Set the domain in the harness (device fixture domain is a separate
+  concern to handle at emit time).
+- **Attribute-scale Quant/Dequant:** `_exec_deeploy` read scale/zp from node INPUTS only; `fold_qcdq_to_quant_
+  dequant` emits them as ATTRIBUTES. Added an additive attr fallback in
+  `onnx4deeploy/utils/onnx_node_implementations.py` (`_exec_deeploy`, Quant+Dequant) — also reads
+  `bit_width`. `_exec_deeploy` RequantShift **already supports per-channel `mul`** (NCHW/NHWC broadcast,
+  lines 852-865) — good, the per-channel absorption will validate here.
+
+### KEY FINDING — the `-mode quant` `network.onnx` is NOT a numerically-correct integer graph
+Ran `network.onnx` (toposorted, domains fixed) on the real int8 input; output = **all zeros** (its argmax 0
+only *coincidentally* equals the reference argmax 0). Root reasons:
+- It is a **hybrid**: fp32 conv (weight still dequantized) feeding an **integer** RequantShift. Feeding a tiny
+  fp32 conv output to the integer RequantShift (`x.astype(int64)`) truncates to 0.
+- The post-conv RequantShift `mul = 8388608`, `div = 2¹⁶` ⇒ factor **×128 = 1/s_out** only. It **omits both
+  `s_in` and the per-channel `s_w[c]`** (`s_w` was meant to ride in the conv via the dequantized weight;
+  `s_in` is simply absent since the offline int8 input is used raw). So the pipeline graph is not a correct
+  standalone integer graph for SpeechNet — consistent with the QZO_mixed forward-fidelity bugs.
+- ⇒ **Do not transform the `-mode quant` graph** (building on sand). The trustworthy reference is
+  `outputs.npz` = the PyTorch/Brevitas output `[1.999, -0.559, …]` (argmax 0).
+
+### DECISION — build the correct int8 ZO datapath from verified parts (validated vs PyTorch)
+Combine what's verified rather than patch a broken graph:
+- **Offline int8 weights + per-channel `s_w`/`s_b`** from `integerize_perchannel_weights` (iter-2, verified,
+  sourced from the REAL calibrated export) — these are the trainable params, fed as **int8 graph INPUTS**.
+- **Per-channel RequantShift** `mul[c] = round(s_in·s_w[c]/s_out · 2^shift)`, `add = int32 bias` (in the RQS
+  add) — the datapath math VERIFIED earlier in `build_qzo_int8_graph` (its argmax matched Brevitas). Need the
+  activation scales `s_in`/`s_out` per layer (from the graph's Quant/Dequant, or `dump_brevitas_scales`).
+- **Activation path** `Conv(int8) → RequantShift → Dequant(s_out) → Relu → MaxPool → Quant(s_in_next)` (BN is
+  folded here → no BN γ/β), **weights/biases as INPUTS**, `RQSPerturbRademacher` on int8 weights + int32
+  biases, shared `append_cross_entropy_loss`.
+- **Validate against `outputs.npz`** (PyTorch) within quant tolerance (argmax + close logits). Only then wire
+  `_export_qzo_training`, export the real-data fixture, build the update graph.
+
+This keeps the *offline-weights + weights-as-inputs + per-channel RequantShift* design, reuses the verified
+integerize pass and the verified datapath math, and avoids the broken pipeline graph. `build_qzo_int8_graph`'s
+online-weight-Quant is replaced by offline int8 weight inputs (no weight Quant node at all → the per-channel
+fold problem disappears entirely).
+
+### Activation scales captured (de-risks iter-4) — all UNIFORM 1/128
+Every `Quant`/`Dequant` activation scale = **0.0078125 = 1/128**, and block0 offline input scale `s_in0` =
+**1/128** too. So **`s_in = s_out = 1/128` for every layer**. The per-channel post-conv RequantShift therefore
+simplifies to:
+```
+mul[c] = round(s_in·s_w[c]/s_out · 2^shift) = round(s_w[c] · 2^shift)     # s_in,s_out cancel
+add    = int32 bias[c]      (per-channel, from integerize)
+```
+This also nails the pipeline bug quantitatively: its RequantShift factor is `1/s_out = 128` (per-tensor),
+whereas the correct factor is `s_w[c] ≈ 5e-4` → **~128× too large**, which truncates to 0 on the int
+RequantShift → the all-zeros output. Confirms the `-mode quant` graph is wrong for SpeechNet.
+
+### Next iteration (4) — implement the datapath builder + validate
+With everything in hand (int8 weights + per-channel `s_w`/`s_b` from `integerize`; `s_in=s_out=1/128`), build
+the int8 ZO datapath and validate the eps=0 forward vs `outputs.npz` (PyTorch, argmax 0, `[1.999,…]`):
+`a_int8 → Conv(int8 weight INPUT) → RequantShift(mul[c]=round(s_w[c]·2^shift), add=int32 bias INPUT) →
+Dequant(1/128) → Relu → MaxPool → Quant(1/128) → …`; fc analogous (Gemm). Then `RQSPerturbRademacher` on the
+int8 weight/bias inputs + `append_cross_entropy_loss` → `zo_train`; mirror for `zo_update`; wire
+`_export_qzo_training` (comment out `build_qzo_int8_graph`); export real-data fixture to `QZO_exp/exp2/`.

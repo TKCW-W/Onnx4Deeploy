@@ -813,9 +813,14 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
 def _exec_deeploy(op: str, inputs: List, attrs: Dict[str, Any], add_is_initializer: bool = True) -> List[np.ndarray]:
     if op == "Quant":
         x = inputs[0].astype(np.float64)
-        scale = inputs[1].astype(np.float64)
-        zp = inputs[2].astype(np.float64)
-        bits = int(attrs.get("bits", 8))
+        # QW: support BOTH conventions — DeepQuant emits scale/zp as node INPUTS, while
+        #     create_quant_pipeline's fold_qcdq_to_quant_dequant emits them as ATTRIBUTES.
+        #     Fall back to attrs when the inputs aren't present. -- QW
+        if len(inputs) >= 3:
+            scale = inputs[1].astype(np.float64); zp = inputs[2].astype(np.float64)
+        else:
+            scale = np.asarray(attrs["scale"], np.float64); zp = np.asarray(attrs.get("zero_point", 0.0), np.float64)
+        bits = int(attrs.get("bit_width", attrs.get("bits", 8)))
         signed = bool(attrs.get("signed", True))
         qmin = -(2 ** (bits-1)) if signed else 0
         qmax = (2 ** (bits-1)) - 1 if signed else (2**bits) - 1
@@ -823,8 +828,10 @@ def _exec_deeploy(op: str, inputs: List, attrs: Dict[str, Any], add_is_initializ
 
     if op == "Dequant":
         q = inputs[0].astype(np.float64)
-        scale = inputs[1].astype(np.float64)
-        zp = inputs[2].astype(np.float64)
+        if len(inputs) >= 3:                                   # QW: input- vs attribute-scale (see Quant) -- QW
+            scale = inputs[1].astype(np.float64); zp = inputs[2].astype(np.float64)
+        else:
+            scale = np.asarray(attrs["scale"], np.float64); zp = np.asarray(attrs.get("zero_point", 0.0), np.float64)
         return [((q - zp) * scale).astype(np.float32)]
 
     if op == "RequantShift":

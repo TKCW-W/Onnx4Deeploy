@@ -41,8 +41,13 @@ def _np(x):
 # _promote_initializers_to_inputs / append_cross_entropy_loss) rather than rebuilding from the
 # torch model. Supersedes build_qzo_int8_graph (kept below, deprecated, per comment-don't-delete).
 # ===========================================================================================
-DIV_W, NL_W = 2 ** 15, 256          # weight perturb: int8, div=2^15, n_levels=256
-DIV_B, NL_B = 2 ** 31, 2 ** 32      # bias perturb:   int32, div=2^31, n_levels=2^32
+DIV_W, NL_W = 2 ** 15, 256          # weight perturb: int8,  div=2^15, n_levels=256
+DIV_B, NL_B = 2 ** 16, 2 ** 32      # bias  perturb: int32, div=2^16 (= the RequantShift div; mul stays in
+                                    # int32 range, unlike 2^31 which overflows), n_levels=2^32
+# QW: perturb the int32 bias (in the RequantShift add) as well as the int8 weights. Setting this False keeps
+#     the bias a baked constant (standard RequantizedConv with a variable weight only) — the lower-risk device
+#     path for the first single-step smoke test; True needs the RQSConv parser to accept a variable add. -- QW
+PERTURB_BIAS = False
 
 
 def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42,
@@ -69,7 +74,7 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
     param_inputs, new_nodes, promote = {}, [], []
 
     for pname, scale, div, nlev, idx, in_idx, node in _iter_qzo_params(model, scale_map):
-        mul = np.round(eps / scale * div).astype(np.int64).astype(np.float32)
+        mul = np.round(eps / scale * div).astype(np.int32)      # int32 mul (RQSPerturb binding expects int32_t)
         mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
         g.initializer.append(mk)
         new_nodes.append(helper.make_node(
@@ -99,9 +104,13 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
 
 
 def _iter_qzo_params(model, scale_map):
-    """Yield (param_name, scale_array, div, n_levels, idx) for each Conv/Gemm weight+bias in graph order.
-    Canonical order (weight then bias per Conv/Gemm) — SHARED by train + update so the perturb z matches."""
+    """Yield (param_name, scale, div, n_levels, idx, target_input_idx, target_node) for each perturbable
+    param in graph order — SHARED by train + update so the perturb z matches. After build_int8_forward the
+    trainable params are: each Conv/Gemm int8 **weight** (input[1]); each conv **bias** which now lives in
+    the following **RequantShift `add`** (int32, input[2]). The fc bias became an fp32 constant Add (not
+    perturbed in the current device step)."""
     initmap = {i.name: i for i in model.graph.initializer}
+    node_by_name = {n.name: n for n in model.graph.node}
     idx = 0
     for n in model.graph.node:
         if n.op_type not in ("Conv", "Gemm"):
@@ -109,12 +118,14 @@ def _iter_qzo_params(model, scale_map):
         ent = scale_map.get(n.name)
         if ent is None:
             continue
-        for in_idx, key, div, nlev in ((1, "weight_scale", DIV_W, NL_W), (2, "bias_scale", DIV_B, NL_B)):
-            pname = n.input[in_idx]
-            if pname not in initmap:
-                continue
-            yield pname, np.asarray(ent[key], np.float64).reshape(-1), div, nlev, idx, in_idx, n
+        if len(n.input) > 1 and n.input[1] in initmap:                 # int8 weight
+            yield n.input[1], np.asarray(ent["weight_scale"], np.float64).reshape(-1), DIV_W, NL_W, idx, 1, n
             idx += 1
+        if PERTURB_BIAS and "bias_rqs_name" in ent:                    # int32 bias in the RequantShift add
+            rqs = node_by_name.get(ent["bias_rqs_node"])
+            if rqs is not None and ent["bias_rqs_name"] in initmap:
+                yield ent["bias_rqs_name"], np.asarray(ent["bias_scale"], np.float64).reshape(-1), DIV_B, NL_B, idx, 2, rqs
+                idx += 1
 
 
 def build_qzo_update_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42):
@@ -136,7 +147,7 @@ def build_qzo_update_graph(quant_network_onnx: str, out_path: str, eps: float = 
         param_inputs[pname] = arr
         ginputs.append(helper.make_tensor_value_info(pname, src_inits[pname].data_type, list(arr.shape)))
         goutputs.append(helper.make_tensor_value_info(f"{pname}_updated", src_inits[pname].data_type, list(arr.shape)))
-        mul = np.round(eps / scale * div).astype(np.int64).astype(np.float32)
+        mul = np.round(eps / scale * div).astype(np.int32)      # int32 mul (RQSPerturb binding expects int32_t)
         mk = numpy_helper.from_array(mul, name=f"{pname}_pmul")
         inits.append(mk)
         nodes.append(helper.make_node(

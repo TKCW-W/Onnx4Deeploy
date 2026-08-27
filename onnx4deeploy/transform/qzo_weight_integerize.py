@@ -303,11 +303,22 @@ def build_int8_forward(
         s_w = np.asarray(ent["weight_scale"], np.float64).reshape(-1)
         rqs = next((c for c in cons.get(n.output[0], []) if c.op_type == "RequantShift"), None)
         if rqs is not None:
-            # conv: keep int32 bias in Conv; per-channel RequantShift mul, add = 0.
+            # conv: per-channel RequantShift mul; MOVE the int32 bias from the Conv into the RequantShift
+            # `add` (the device int8-conv binding won't consume a *variable* int32 bias, but RequantShift's
+            # add accepts one — so the bias stays perturbable). Conv becomes 2-input. -- QW
             mul = np.round(s_w * (s_in / s_out) * div).astype(np.int32)
-            add = np.zeros_like(mul)
+            b_name = n.input[2] if len(n.input) > 2 else None
+            if b_name is not None and b_name in initmap:
+                b = numpy_helper.to_array(initmap[b_name]).astype(np.float64).reshape(-1)
+                add = np.round(s_w * b * div).astype(np.int32)          # int32 bias in RQS-add units
+                add_name = f"{ent['bias_src']}_rqsadd"
+                del n.input[2]                                          # Conv now 2-input (weight only)
+                ent["bias_rqs_name"] = add_name                        # perturbable int32 bias lives here
+                ent["bias_rqs_node"] = rqs.name
+            else:
+                add = np.zeros_like(mul); add_name = rqs.input[2] + "_pc"
             nm = numpy_helper.from_array(mul, name=rqs.input[1] + "_pc")
-            na = numpy_helper.from_array(add, name=rqs.input[2] + "_pc")
+            na = numpy_helper.from_array(add, name=add_name)
             rqs.input[1], rqs.input[2] = nm.name, na.name
             g.initializer.extend([nm, na])
             for a in list(rqs.attribute):
@@ -317,15 +328,25 @@ def build_int8_forward(
                 onnx.helper.make_attribute("div", numpy_helper.from_array(np.array(div, np.int64)))
             )
         elif n.output[0] in graph_outs:
-            # fc output layer: keep int32 bias in Gemm; append per-channel dequant Mul.
+            # fc output layer: 2-input Gemm (int8 weight only) → per-channel dequant Mul → +fp32 bias.
+            # The bias moves OUT of the Gemm (device Gemm won't take a variable int32 bias) and becomes an
+            # fp32 Add after the dequant (float-perturbable later; a constant for this first device step). -- QW
             s_fc = (s_in * s_w).astype(np.float32)
             gemm_out = n.output[0] + "_int"
             n.output[0] = gemm_out
             sc = numpy_helper.from_array(s_fc, name="fc_dq_scale")
             g.initializer.append(sc)
-            g.node.append(
-                onnx.helper.make_node("Mul", [gemm_out, sc.name], ["output"], name="fc_dequant_mul")
-            )
+            b_name = n.input[2] if len(n.input) > 2 else None
+            if b_name is not None and b_name in initmap:
+                s_b = np.asarray(ent["bias_scale"], np.float64).reshape(-1)
+                b_real = (numpy_helper.to_array(initmap[b_name]).astype(np.float64).reshape(-1) * s_b).astype(np.float32)
+                del n.input[2]                                         # Gemm now 2-input
+                br = numpy_helper.from_array(b_real, name=f"{ent['bias_src']}_real")
+                g.initializer.append(br)
+                g.node.append(onnx.helper.make_node("Mul", [gemm_out, sc.name], ["fc_dq"], name="fc_dequant_mul"))
+                g.node.append(onnx.helper.make_node("Add", ["fc_dq", br.name], ["output"], name="fc_bias_add"))
+            else:
+                g.node.append(onnx.helper.make_node("Mul", [gemm_out, sc.name], ["output"], name="fc_dequant_mul"))
 
     for n in g.node:
         if n.op_type in ("Quant", "Dequant", "RequantShift"):

@@ -31,7 +31,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
-from onnx import numpy_helper
+from onnx import numpy_helper, TensorProto
+
+TP_I8, TP_I32, TP_F32, TP_I64 = TensorProto.INT8, TensorProto.INT32, TensorProto.FLOAT, TensorProto.INT64
 
 
 def _build_maps(graph: onnx.GraphProto):
@@ -208,6 +210,38 @@ def _prune_orphans(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
+def _annotate_shapes_via_run(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Give every intermediate tensor an exact shape/dtype by running the graph once (the custom
+    Quant/Dequant/RequantShift ops block ONNX shape inference; Deeploy's _assertTensorsHaveShape needs
+    them all). Requests every node output from run_onnx_graph on a zero int8 input; weights are still
+    initializers here so only `input` must be fed."""
+    import tempfile as _tf, os as _os
+    from onnx4deeploy.utils.onnx_node_implementations import run_onnx_graph
+    _np_dtype = {np.dtype("int8"): TP_I8, np.dtype("int32"): TP_I32, np.dtype("float32"): TP_F32,
+                 np.dtype("int64"): TP_I64}
+    g = model.graph
+    shape = [d.dim_value for d in g.input[0].type.tensor_type.shape.dim]
+    dummy = np.zeros(shape, dtype=np.int8)
+    have = {o.name for o in g.output} | {i.name for i in g.input} | {i.name for i in g.initializer}
+    outs = [o for n in g.node for o in n.output if o not in have]
+    tmp = _os.path.join(_tf.gettempdir(), "_qzo_shape.onnx")
+    onnx.save(model, tmp)
+    try:
+        res = run_onnx_graph(tmp, {g.input[0].name: dummy}, output_names=outs)
+    finally:
+        try: _os.remove(tmp)
+        except OSError: pass
+    captured = {name: np.asarray(arr) for name, arr in zip(outs, res)}
+    # drop any stale (possibly shapeless) value_info for captured names, then re-add exact shapes.
+    keep = [v for v in g.value_info if v.name not in captured]
+    del g.value_info[:]
+    g.value_info.extend(keep)
+    for name, a in captured.items():
+        g.value_info.append(onnx.helper.make_tensor_value_info(
+            name, _np_dtype.get(a.dtype, TP_F32), list(a.shape)))
+    return model
+
+
 def _toposort(model: onnx.ModelProto) -> onnx.ModelProto:
     g = model.graph
     have = {i.name for i in g.initializer} | {i.name for i in g.input}
@@ -296,4 +330,6 @@ def build_int8_forward(
     for n in g.node:
         if n.op_type in ("Quant", "Dequant", "RequantShift"):
             n.domain = "ai.onnx.contrib"
-    return _toposort(_prune_orphans(model)), scale_map
+    model = _toposort(_prune_orphans(model))
+    _annotate_shapes_via_run(model)          # exact intermediate shapes for Deeploy's shape assert -- QW
+    return model, scale_map

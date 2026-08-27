@@ -77,7 +77,12 @@ def build_qzo_train_graph(quant_network_onnx: str, out_path: str, eps: float = 0
             name=f"rqsp_{pname}", domain="mezo", idx=idx, seed=seed, signed=1, div=div, n_levels=nlev))
         node.input[in_idx] = f"{pname}_pert"
         promote.append(pname)
-        param_inputs[pname] = numpy_helper.to_array(initmap[pname])
+        w = numpy_helper.to_array(initmap[pname])
+        param_inputs[pname] = w
+        # annotate the perturbed edge shape/dtype — ORT can't infer through the custom mezo op, and Deeploy's
+        # lowering (_isDepthwise reads inputs[1].shape) crashes on a shapeless conv weight. -- QW
+        elem = TensorProto.INT8 if w.dtype == np.int8 else (TensorProto.INT32 if w.dtype == np.int32 else TensorProto.FLOAT)
+        g.value_info.append(helper.make_tensor_value_info(f"{pname}_pert", elem, list(w.shape)))
 
     g.node.extend(new_nodes)
     _promote_initializers_to_inputs(g, promote)

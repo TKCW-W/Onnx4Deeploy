@@ -501,3 +501,62 @@ on the perturbed weight edge, whether the conv weight is a graph **input** vs an
 `RQSPerturbRademacher` output typing, and any attrs the PULP conv parser requires (e.g. weight `nLevels`,
 `signed`, group). Align our `build_int8_forward`/`build_qzo_train_graph` emission to match, then finish codegen
 → GVSoC sim → compare device L±/grad vs host.
+
+---
+
+## Iteration 10 — the device blocker is a real Deeploy limitation (int8 conv + runtime weight) (2026-08-27)
+
+Tried QZO_mixed's own packed `speechnet_qzo_mixed_int8_train` on `feat/QZO`: **it also fails** — but at a
+plain `Conv` matching **float** parsers (`PULPFPConv2DParser`), i.e. QZO_mixed's perturbed weight is **fp32**,
+so its conv fell back to **fp32** (their documented Bug A/B: `PULP_Conv2d_Im2Col_fp32`, no int8 conv). **Ours
+is a genuine int8 `RequantizedConv`** — strictly more correct — but the int8 conv chain rejects a **variable
+(perturbed) weight**:
+- Parser is fine (`Conv2DParser.parseNodeCtxt` only checks `len(weight.shape)==4`, no `.values`/constant req).
+- The conv weight is `blocks.0.conv.weight_int8_pert` = an **`RQSPerturbRademacher` output** (a runtime
+  Variable), not a Constant. The **`ConvChecker` (SignProp, `Generic/TypeCheckers.py:543`)** must infer the
+  RequantizedConv output nLevels/signedness *through* that variable int8 weight — the same `nLevels=None`
+  situation the ported `RQSPerturbZOChecker` had to special-case. For a runtime weight with no
+  back-inferable levels the binding is silently rejected → "exhausted backtracking".
+
+**Root finding:** Deeploy's int8 `RequantizedConv` type-inference/tiling assumes a **compile-time-constant
+weight** (hoisted for im2col); a **runtime-perturbed int8 weight** is not supported. The float conv path
+allows a variable weight (hence float ZO works), and QZO_mixed only got int8-ZO to "run" by keeping the conv
+**fp32**. Making a TRUE int8 conv consume a runtime weight needs Deeploy type-checker + tile-constraint work
+(propagate the perturbed weight's nLevels/signedness, allow a non-constant weight in the RequantizedConv tile
+solution) — a substantial, novel Deeploy sub-project, not a fixture tweak.
+
+Device fixes shipped this run (all committed, reusable): shape annotations (×2), `RQSPerturbRademacher` port
+cherry-picks (×3), merge-pass variable-add guard, int32-mul overflow fix, bias-in-RQS-add datapath. The int8
+ZO graph now compiles **through the entire network except the int8-conv-with-runtime-weight** node.
+
+---
+
+# ═══ CONCLUSION — result of this /loop run ═══
+
+**PRIMARY GOAL: ACHIEVED & VALIDATED.** `Onnx4Deeploy` is now a completely extended, quantized-ZO-capable
+exporter. `python Onnx4Deeploy.py -mode q-zo-train …` generates, end-to-end from **real SilentWear data +
+fold_3 pretrained weights**, a **quantized-ZO fixture** with:
+- **offline int8 per-channel weights** (per-channel RequantShift), **trainable params as graph INPUTS**,
+  `RQSPerturbRademacher` perturbation, canonical `SoftmaxCrossEntropyLoss`, and a host `L+/L-/grad` reference;
+- built as a **true extension** of the shipped quant pipeline (`exportBrevitas` + `create_quant_pipeline`) and
+  the float-ZO transform helpers (`_promote_initializers_to_inputs`, `append_cross_entropy_loss`), plus the new
+  per-channel integerizer (`qzo_weight_integerize`) that closes the pipeline's per-channel-weight gap;
+- **numerically validated**: the int8 forward matches PyTorch (cos≈1.0000, maxdiff≈0.008); eps=0 → identity;
+  eps>0 → real ZO gradient (L+≠L-). (Iterations 1–7.)
+
+**OPTIONAL GOAL (TrainDeeploy on-device smoke test): SUBSTANTIALLY ADVANCED, blocked at a characterized Deeploy
+limitation.** Packed the fixture and drove GVSoC codegen; unblocked **7 device issues** (2 shape annotations, 3
+RQSPerturbRademacher-port cherry-picks, merge-pass variable-add guard, int32-mul overflow) and restructured to
+the device-compatible bias-in-RequantShift-add datapath. The int8 ZO graph compiles through the whole network
+**except** the int8 `RequantizedConv` with a **runtime-perturbed weight** — a genuine Deeploy limitation
+(int8 conv assumes a constant weight; QZO_mixed avoided it by falling back to fp32 conv). Closing it is a
+separate Deeploy type-checker/tile-constraint project. (Iterations 8–10.)
+
+**Files/commits:** Onnx4Deeploy `feat/QZO` — `qzo_weight_integerize.py`, `qzo_transform.py`,
+`base_exporter.py` (`_export_qzo_training`), `onnx_node_implementations.py`; TrainDeeploy `feat/QZO` —
+RQSPerturbRademacher port (5e786aa, 967dba5, 8a853ce) + merge guard (ee569cf). Full log above.
+
+**Recommended next step (if pursuing device):** implement runtime-weight support in the PULP int8
+`RequantizedConv` — extend `ConvChecker` to infer levels/signedness through a variable int8 weight (mirror the
+`RQSPerturbZOChecker` nLevels fallback) and relax the conv tile-constraint to admit a non-constant weight
+buffer; then finish codegen → GVSoC sim → compare device L±/grad vs host `outputs.npz`.

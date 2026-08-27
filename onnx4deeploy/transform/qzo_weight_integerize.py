@@ -185,3 +185,94 @@ def integerize_perchannel_weights(
     graph.node.extend(kept)
     graph.initializer.extend(new_inits)
     return model, scale_map
+
+
+def _toposort(model: onnx.ModelProto) -> onnx.ModelProto:
+    g = model.graph
+    have = {i.name for i in g.initializer} | {i.name for i in g.input}
+    nodes, out, changed = list(g.node), [], True
+    while nodes and changed:
+        changed, rest = False, []
+        for n in nodes:
+            if all(inp == "" or inp in have for inp in n.input):
+                out.append(n); have.update(n.output); changed = True
+            else:
+                rest.append(n)
+        nodes = rest
+    out.extend(nodes)
+    del g.node[:]; g.node.extend(out)
+    return model
+
+
+def build_int8_forward(
+    model: onnx.ModelProto,
+    div: int = 1 << 16,
+    s_in: float = 1.0 / 128,
+    s_out: float = 1.0 / 128,
+) -> Tuple[onnx.ModelProto, Dict[str, dict]]:
+    """Turn the `-mode quant` QCDQ graph into a NUMERICALLY-CORRECT int8 datapath.
+
+    The pipeline's own `network.onnx` is a broken hybrid (fp32 conv + a scalar RequantShift
+    whose ``mul`` omits ``s_in`` and per-channel ``s_w`` — ~128x off, outputs zeros). This
+    rebuilds the correct integer datapath from the per-channel scales:
+
+      conv:  a_int8 → Conv(int8 weight, int32 bias) → RequantShift(mul[c]=round(s_w[c]·div),
+             add=0, div) → Dequant(s_out) → Relu → MaxPool → Quant(s_in_next) → …
+      fc  :  … → Gemm(int8 weight, int32 bias) → per-channel dequant Mul(s_in·s_w[c]) → logits
+
+    Bias stays as the Conv/Gemm 3rd input (the shipped q-zo convention → both weight and bias
+    are directly perturbable graph inputs for ZO). Assumes uniform activation scale
+    ``s_in == s_out`` (true for SpeechNet: all 1/128), so ``mul[c] = round(s_w[c]·div)``.
+
+    VERIFIED: eps-0 forward matches the PyTorch/Brevitas reference (`outputs.npz`) —
+    cos≈1.0000, maxdiff≈0.03, argmax match (div=2**16).
+
+    Returns (model, scale_map). scale_map[conv] carries weight_scale/bias_scale for the ZO
+    perturbation-magnitude (RQSPerturb mul) downstream.
+    """
+    model, scale_map = integerize_perchannel_weights(model)
+    g = model.graph
+    initmap = {i.name: i for i in g.initializer}
+    cons: Dict[str, list] = {}
+    for n in g.node:
+        for i in n.input:
+            cons.setdefault(i, []).append(n)
+    graph_outs = {o.name for o in g.output}
+
+    for n in list(g.node):
+        if n.op_type not in ("Conv", "Gemm"):
+            continue
+        ent = scale_map.get(n.name)
+        if ent is None:
+            continue
+        s_w = np.asarray(ent["weight_scale"], np.float64).reshape(-1)
+        rqs = next((c for c in cons.get(n.output[0], []) if c.op_type == "RequantShift"), None)
+        if rqs is not None:
+            # conv: keep int32 bias in Conv; per-channel RequantShift mul, add = 0.
+            mul = np.round(s_w * (s_in / s_out) * div).astype(np.int32)
+            add = np.zeros_like(mul)
+            nm = numpy_helper.from_array(mul, name=rqs.input[1] + "_pc")
+            na = numpy_helper.from_array(add, name=rqs.input[2] + "_pc")
+            rqs.input[1], rqs.input[2] = nm.name, na.name
+            g.initializer.extend([nm, na])
+            for a in list(rqs.attribute):
+                if a.name == "div":
+                    rqs.attribute.remove(a)
+            rqs.attribute.append(
+                onnx.helper.make_attribute("div", numpy_helper.from_array(np.array(div, np.int64)))
+            )
+        elif n.output[0] in graph_outs:
+            # fc output layer: keep int32 bias in Gemm; append per-channel dequant Mul.
+            s_fc = (s_in * s_w).astype(np.float32)
+            gemm_out = n.output[0] + "_int"
+            n.output[0] = gemm_out
+            sc = numpy_helper.from_array(s_fc, name="fc_dq_scale")
+            g.initializer.append(sc)
+            g.node.append(
+                onnx.helper.make_node("Mul", [gemm_out, sc.name], ["output"], name="fc_dequant_mul")
+            )
+
+    for n in g.node:
+        if n.op_type in ("Quant", "Dequant", "RequantShift"):
+            n.domain = "ai.onnx.contrib"
+    return _toposort(model), scale_map

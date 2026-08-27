@@ -251,3 +251,43 @@ the int8 ZO datapath and validate the eps=0 forward vs `outputs.npz` (PyTorch, a
 Dequant(1/128) → Relu → MaxPool → Quant(1/128) → …`; fc analogous (Gemm). Then `RQSPerturbRademacher` on the
 int8 weight/bias inputs + `append_cross_entropy_loss` → `zo_train`; mirror for `zo_update`; wire
 `_export_qzo_training` (comment out `build_qzo_int8_graph`); export real-data fixture to `QZO_exp/exp2/`.
+
+---
+
+## Iteration 4 — VALIDATED int8 datapath (numerically matches PyTorch) (2026-08-27)
+
+### Implemented `build_int8_forward` (in `qzo_weight_integerize.py`) — VERIFIED
+Turns the broken `-mode quant` QCDQ graph into a numerically-correct int8 datapath:
+- `integerize_perchannel_weights` → int8 weights + int32 biases (bias kept as the **Conv/Gemm 3rd input** —
+  the shipped q-zo convention → both weight & bias are directly perturbable graph inputs for ZO).
+- **conv:** patch the post-conv RequantShift → `mul[c] = round(s_w[c]·(s_in/s_out)·div)`, `add = 0`, `div`;
+  bias stays in Conv (`o = (acc+b_int32)·mul/div`). With `s_in=s_out=1/128` ⇒ `mul[c]=round(s_w[c]·div)`.
+- **fc (output layer, no RequantShift after Gemm):** keep int32 bias in Gemm, append a **per-channel dequant
+  `Mul(s_in·s_w[c])`** → f32 logits (`logit[c] = gemm_out · s_in·s_w_fc[c]`).
+- domains set to `ai.onnx.contrib`; toposorted.
+
+### Numerical validation vs PyTorch reference (`outputs.npz`) — PASS
+`run_onnx_graph(network_int8_infer.onnx, inputs.npz) → logits`, compared to the PyTorch output:
+| DIV | argmax | cos | maxdiff |
+|--|--|--|--|
+| 2^16 (RQS-add bias) | 0==0 ✅ | 1.0000 | 0.008 |
+| **2^16 (bias-in-Conv, shipped conv.)** | **0==0 ✅** | **0.9999** | **0.032** |
+| 2^18 / 2^20 | 0==0 ✅ | 1.0000 | 0.006–0.008 |
+`out=[2.01,-0.57,-1.02,-0.74,…]` vs `ref=[1.999,-0.559,-1.015,-0.71,…]` — matches within quant noise.
+Chose **bias-in-Conv, DIV=2^16** (ZO-friendly + shipped convention). Artifact:
+`QZO_exp/exp2/network_int8_infer.onnx` (int8 input, RequantShift×6, Quant×5, Dequant×5, per-channel).
+
+**This closes the correctness gate** — we now have a real, validated int8 SpeechNet inference datapath built
+from the export + per-channel scales (offline weights), reproducing PyTorch. Known cleanup: 56 orphan
+`Constant` + 24 `Cast` (dead ends from removed QCDQ) — harmless, prune later.
+
+### Next iteration (5) — ZO fixture from the validated int8 graph
+1. Promote int8 weights + int32 biases to graph **INPUTS** (`_promote_initializers_to_inputs`).
+2. Inject `RQSPerturbRademacher` on each (weight: div=2^15,n_levels=256; bias int32: div=2^31,n_levels=2^32),
+   perturb-`mul = round(eps/s_w·2^15)` from the `scale_map` — reuse the float `inject_perturbation_nodes`
+   rqs_rademacher machinery (it already targets Conv/Gemm weight+bias, promotes to inputs).
+3. `append_cross_entropy_loss` (label input) → `network_zo_train.onnx`; validate eps=0 == inference; check
+   eps>0 L+/L- differ.
+4. `generate_weight_update_graph` → `network_zo_update.onnx`. Wire `_export_qzo_training` through this
+   (comment out `build_qzo_int8_graph`); export real-data fixture to `QZO_exp/exp2/` with `inputs.npz`
+   (int8 weights+biases as inputs) + host L+/L- reference.

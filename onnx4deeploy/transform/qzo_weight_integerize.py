@@ -305,22 +305,15 @@ def build_int8_forward(
         s_w = np.asarray(ent["weight_scale"], np.float64).reshape(-1)
         rqs = next((c for c in cons.get(n.output[0], []) if c.op_type == "RequantShift"), None)
         if rqs is not None:
-            # conv: per-channel RequantShift mul; MOVE the int32 bias from the Conv into the RequantShift
-            # `add` (the device int8-conv binding won't consume a *variable* int32 bias, but RequantShift's
-            # add accepts one — so the bias stays perturbable). Conv becomes 2-input. -- QW
+            # conv KEEPS its int32 bias (3-input: data_in, weight, bias). The Conv+RequantShift merge then
+            # yields a 5-input RequantizedConv (data_in, weight, bias, mul, add) — exactly what the shipped
+            # PULP int8 conv binding (PULPRQSConv2DBindings) expects. Per-channel RequantShift carries
+            # mul[c] = round(s_w[c]·s_in/s_out·div); add = 0 (the merge bakes the rounding). Weight AND bias
+            # are perturbed as CONV inputs (a variable weight/bias binds fine — the float ZO does the same). -- QW
             mul = np.round(s_w * (s_in / s_out) * div).astype(np.int32)
-            b_name = n.input[2] if len(n.input) > 2 else None
-            if b_name is not None and b_name in initmap:
-                b = numpy_helper.to_array(initmap[b_name]).astype(np.float64).reshape(-1)
-                add = np.round(s_w * b * div).astype(np.int32)          # int32 bias in RQS-add units
-                add_name = f"{ent['bias_src']}_rqsadd"
-                del n.input[2]                                          # Conv now 2-input (weight only)
-                ent["bias_rqs_name"] = add_name                        # perturbable int32 bias lives here
-                ent["bias_rqs_node"] = rqs.name
-            else:
-                add = np.zeros_like(mul); add_name = rqs.input[2] + "_pc"
+            add = np.zeros(mul.shape, np.int32)
             nm = numpy_helper.from_array(mul, name=rqs.input[1] + "_pc")
-            na = numpy_helper.from_array(add, name=add_name)
+            na = numpy_helper.from_array(add, name=rqs.input[2] + "_pc")
             rqs.input[1], rqs.input[2] = nm.name, na.name
             g.initializer.extend([nm, na])
             for a in list(rqs.attribute):

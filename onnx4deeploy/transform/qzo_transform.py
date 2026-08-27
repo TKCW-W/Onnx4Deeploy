@@ -125,16 +125,14 @@ def _iter_qzo_params(model, scale_map):
         ent = scale_map.get(n.name)
         if ent is None:
             continue
-        if len(n.input) > 1 and n.input[1] in initmap:                 # int8 weight
+        if len(n.input) > 1 and n.input[1] in initmap:                 # int8 weight (Conv/Gemm input[1])
             yield dict(kind="rqs", name=n.input[1], scale=np.asarray(ent["weight_scale"], np.float64).reshape(-1),
                        div=DIV_W, nlev=NL_W, idx=idx, in_idx=1, node=n)
             idx += 1
-        if PERTURB_BIAS and "bias_rqs_name" in ent:                    # int32 bias in the RequantShift add
-            rqs = node_by_name.get(ent["bias_rqs_node"])
-            if rqs is not None and ent["bias_rqs_name"] in initmap:
-                yield dict(kind="rqs", name=ent["bias_rqs_name"], scale=np.asarray(ent["bias_scale"], np.float64).reshape(-1),
-                           div=DIV_B, nlev=NL_B, idx=idx, in_idx=2, node=rqs)
-                idx += 1
+        if PERTURB_BIAS and len(n.input) > 2 and n.input[2] in initmap:  # int32 bias (Conv input[2], kept in conv)
+            yield dict(kind="rqs", name=n.input[2], scale=np.asarray(ent["bias_scale"], np.float64).reshape(-1),
+                       div=DIV_B, nlev=NL_B, idx=idx, in_idx=2, node=n)
+            idx += 1
     for n in model.graph.node:                                         # 2. BN γ/β — fp32, float Rademacher
         if n.op_type != "BatchNormInternal":
             continue

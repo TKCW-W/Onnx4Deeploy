@@ -106,3 +106,81 @@ feeding the Conv directly. Our SpeechNet export doesn't fold it (the `Cast×2` b
 - Temp inspection scripts written under the mount root (`/Users/qiwenwu/ETH/_qzo_*.py`) — removed at end of
   iteration.
 - `agitated_hugle` quant export requires `PYTHONPATH=/app/Onnx4Deeploy/DeepQuant` (recorded).
+
+---
+
+## Iteration 2 — root-cause the weight integerization; scope the fix (2026-08-27)
+
+### ROOT CAUSE of the un-integerized weights (definitive, code-level)
+- `create_quant_pipeline` pass #3 `fold_qcdq_to_quant_dequant` (`optimization/qcdq_to_deeploy.py:148`) collapses
+  `Div→Add→Round→Clip → Quant` **only for per-TENSOR scales**: its `_const_scalar` returns `None` when
+  `v.size != 1` (`:165-167`), so a **per-channel weight scale (size C) is skipped** and the weight QCDQ stays
+  raw. Pass #4 `constfold_quant_of_initializer` (`:502`) only folds a *Quant node* whose input is an
+  initializer — since the weight never became a Quant, it's never integerized. Verified: `network.onnx`
+  activations fold to `Quant×5` but conv/fc weights remain f32 `Div→…→Mul→Conv` (0 int8 initializers).
+- The Casts in the weight chain are only on the **Clip bounds** (`Cast(Constant)`), not the data path — so the
+  sole blocker is the **per-channel scale**, exactly the per-tensor limitation from the earlier discussion.
+- The requant builder `fold_dequant_quant_to_requantshift` (`:290`) computes `mul` from **activation scales
+  only** (`scale_d/scale_q`, scalar, `:330`). There is **no path for the weight scale `s_w` to enter the
+  post-conv RequantShift**, and for per-channel `s_w[c]` that RequantShift `mul` would have to be per-channel.
+  ⇒ The existing pipeline integerizes **per-tensor** weights end-to-end but silently leaves **per-channel**
+  weights as fp32 QCDQ (device would run fp32 conv — the QZO_mixed Bug A/B).
+
+### Shipped QMCUNet q-zo — how it actually represents weights (ground truth)
+Inspected `Onnx4Deeploy_ZO/QMCUNet-Rad/network_infer.onnx` (the proven q-infer base) around the first Conv:
+- Activations are fully QCDQ'd (`Div/Add/Round/Clip → Sub/Mul`, per-tensor scale 1/128).
+- **The conv weight is a RAW FLOAT initializer** (`[16,3,3,3]`, ±0.07, `intval=False`) fed **directly** to
+  Conv — **no weight QCDQ chain at all**. In `network_zo_train.onnx` this float weight goes through
+  `RQSPerturbRademacher` (per-channel `mul[16]`) straight into Conv.
+- Implication: the shipped q-zo does **not** integerize weights in the ONNX; it ships **float weights +
+  activation QCDQ** and the per-channel weight scale is carried in the RQSPerturb `mul` (and presumably applied
+  by Deeploy at lowering). Our SpeechNet `exportBrevitas` instead emits **weight QCDQ chains** — a real
+  export-form divergence to reconcile.
+
+### Open design question (drives next step)
+Where does per-channel weight quant physically happen for a true device int8 conv?
+- **(P-chan proper)** Extend the pipeline: fold per-channel weight QCDQ → int8 initializer AND emit a
+  **per-channel post-conv RequantShift `mul[c] = s_in·s_w[c]/s_out`** (RequantShift already supports
+  per-channel mul — shipped). This is the correct, supervisor-aligned design; needs 2–3 pass edits + on-device
+  validation.
+- **(Per-tensor v1)** Use per-tensor weight quant → the existing pipeline integerizes end-to-end **today**
+  (int8 weight init + scalar RequantShift, Deeploy merges to int8 conv). Fast, conservative, validated; loses
+  a little accuracy. Per-channel becomes a clean follow-up.
+- **(Shipped-mirror)** Reproduce QMCUNet's float-weight + activation-QCDQ form and let Deeploy quantize the
+  weight — needs understanding the RQSPerturb/Deeploy weight-quant semantics (not yet nailed).
+
+**Chosen direction:** pursue **P-chan proper** (matches the user's explicit per-channel requirement and the
+supervisor). The unambiguous first building block — needed by P-chan — is a **per-channel weight/bias
+constfold**: evaluate each weight/bias `Div→Add→Round→Clip` on the constant → int8/int32 initializer feeding
+the Conv/Gemm directly, and return the per-channel `s_w[c]` map for the RequantShift absorption. Implement +
+unit-test that first (this iteration), then wire the per-channel RequantShift and validate.
+
+### Iteration-2 OUTCOME — per-channel weight/bias constfold IMPLEMENTED + VERIFIED
+New module **`onnx4deeploy/transform/qzo_weight_integerize.py`** —
+`integerize_perchannel_weights(model) -> (model, scale_map)`:
+- Traces each Conv/Gemm weight(input[1]) & bias(input[2]) back through
+  `Mul<-Sub<-Clip<-Round<-Add<-Div<-init` (scales/zp/bounds resolved whether they're initializers OR
+  Constant/Cast outputs — the disambiguation that took two fixes: bounds via `Cast(Constant)`, and Div source =
+  the initializer input vs the Constant scale).
+- Evaluates per-channel int8 weights / int32 biases, rewires the consumer to read the int initializer
+  **directly**, deletes the dead QCDQ+dequant nodes, returns `scale_map[conv] = {weight_scale s_w[C],
+  bias_scale s_b[C], weight_src, bias_src}`.
+
+**Smoke test on the real `qinfer/network.onnx` (verified):** 6 weights → **int8 inits consumed directly** by
+Conv/Gemm; biases → **int32**; **all 12 weight/bias QCDQ chains removed** (residual `Div/Add/Round/Clip/Sub/Mul
+= 0`); activation `Quant×5/Dequant×5/RequantShift×6` preserved; per-channel `s_w` (size = out-channels
+8/16/16/32/32/9) + `s_b` returned. INIT dtypes now `i8×6, i32×18, f32×12(untouched activation consts)`.
+
+Committed as WIP (module not yet wired into the export; the RequantShift `s_w` absorption + numerical
+validation are the next step, below).
+
+### Next iteration (3)
+1. **Per-channel RequantShift `s_w` absorption.** Removing the weight dequant dropped the per-channel `s_w[c]`
+   factor from the conv output; the post-conv activation RequantShift `mul` must absorb it →
+   `mul[c] = s_in·s_w[c]/s_out` (per-channel vector; RequantShift supports it). Build/patch this from
+   `scale_map`, then **numerically validate**: integerized int8-conv graph output == original QCDQ graph output
+   (ORT, same input) within quant tolerance. This is the delicate correctness gate.
+2. Once numerics match: `inject_perturbation_nodes(rqs_rademacher)` on the int8 weights + `_promote_
+   initializers_to_inputs` (weights-as-INPUTS) + `append_cross_entropy_loss` → `network_zo_train.onnx`;
+   `generate_weight_update_graph` → `network_zo_update.onnx`; wire `_export_qzo_training` (comment out
+   `build_qzo_int8_graph`); export real-data fixture to `QZO_exp/exp2/`.

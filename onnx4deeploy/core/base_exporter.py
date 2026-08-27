@@ -664,7 +664,7 @@ class BaseONNXExporter(ABC):
         import torch as _torch
         from brevitas.graph.calibrate import calibration_mode
         from onnx4deeploy.transform.quant_scale_dump import dump_brevitas_scales
-        from onnx4deeploy.transform.qzo_transform import build_qzo_int8_graph
+        from onnx4deeploy.transform.zo_transform import generate_zo_graph
         from onnx4deeploy.utils.onnx_node_implementations import run_onnx_graph
 
         print(f"\n{'='*60}\n🚀 Exporting {self.get_model_name()} to ONNX (Quantized Zeroth-Order Mode)\n{'='*60}\n")
@@ -680,16 +680,21 @@ class BaseONNXExporter(ABC):
         scales_path = _os.path.join(out_dir, "speechnet_scales.json")
         scales = dump_brevitas_scales(model, scales_path)
 
-        print("🔧 Building int8 QZO datapath...")
-        build_qzo_int8_graph(model, scales, self.paths["network_zo_train"],
-                             eps=float(zo_cfg.get("epsilon", 0.01)), seed=int(zo_cfg.get("seed", 42)))
+        # QW: route the int8 QZO build THROUGH generate_zo_graph (extension, not a parallel pipeline):
+        #     it calls build_qzo_int8_graph (weights-as-inputs, Add/Sub, BatchNormInternal) then reuses the
+        #     shared append_cross_entropy_loss. Returns the trainable INPUT values for the reference feed. -- QW
+        print("🔧 Building int8 QZO datapath (via generate_zo_graph)...")
+        param_inputs = generate_zo_graph(
+            inference_onnx=None, output_onnx=self.paths["network_zo_train"],
+            zo_config=zo_cfg, noise_type=noise_type, qzo_model=model, qzo_scales=scales)
 
         print("🧪 Reference (run_onnx_graph)...")
         ishape = self.get_input_shape()
         inp = _np.random.randn(*ishape).astype(_np.float32)
         label = _np.random.randint(0, self.config["num_classes"], (ishape[0], 1)).astype(_np.int64)
-        out = _np.asarray(run_onnx_graph(self.paths["network_zo_train"], {"input": inp, "label": label}))
-        _np.savez(_os.path.join(out_dir, "inputs.npz"), input=inp, label=label)
+        feed = {"input": inp, "label": label, **param_inputs}          # weights-as-inputs -> feed their values
+        out = _np.asarray(run_onnx_graph(self.paths["network_zo_train"], feed, output_names=["log_prob"])[0])
+        _np.savez(_os.path.join(out_dir, "inputs.npz"), input=inp, label=label, **param_inputs)
         _np.savez(_os.path.join(out_dir, "outputs.npz"), output=out)
         print(f"✅ QZO export complete: {self.paths['network_zo_train']} (reference argmax {int(_np.argmax(out))})")
         return self.paths["network_zo_train"]

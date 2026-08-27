@@ -36,13 +36,29 @@ def _promote_initializers_to_inputs(graph, names) -> None:  # -- QW
     del graph.initializer[:]  # -- QW
     graph.initializer.extend(keep_inits)  # -- QW
 
-def generate_zo_graph(inference_onnx:str, output_onnx:str, zo_config:dict, noise_type: str, scales_path: str = None) -> None:
-    """ Generate MeZO ONNX graph for model based on its inference onnx"""
+def generate_zo_graph(inference_onnx:str, output_onnx:str, zo_config:dict, noise_type: str, scales_path: str = None,
+                      qzo_model=None, qzo_scales: dict = None) -> dict:
+    """ Generate MeZO ONNX graph for model based on its inference onnx.
 
+    QW: QZO (int8 quantized-ZO) branch — when `qzo_model`+`qzo_scales` are supplied, the int8 datapath is
+    built directly (weights-as-INPUTS, Div→Add→Round→Clip / Sub→Mul, RQSPerturbRademacher on int8 codes,
+    BatchNormInternal) by `build_qzo_int8_graph`, then this SAME entry appends the canonical SCE loss via the
+    shared `append_cross_entropy_loss` helper — so the QZO graph is produced THROUGH generate_zo_graph and
+    reuses the float path's loss/convention machinery rather than a parallel pipeline. Returns the trainable
+    INPUT values {name: ndarray} for the reference feed. -- QW
+    """
     epsilon, seed, exceptions = zo_config["epsilon"], zo_config["seed"], zo_config.get("exceptions", [])
 
     base_path = os.path.dirname(output_onnx)
     os.makedirs(base_path, exist_ok=True)
+
+    if qzo_model is not None:  # -- QW  QZO int8 datapath
+        from onnx4deeploy.transform.qzo_transform import build_qzo_int8_graph  # -- QW
+        _, param_inputs = build_qzo_int8_graph(  # -- QW
+            qzo_model, qzo_scales, output_onnx, eps=float(epsilon), seed=int(seed))  # -- QW
+        append_cross_entropy_loss(output_onnx, output_onnx, label_name='label')  # -- QW  reuse shared loss
+        return param_inputs  # -- QW
+
     inject_perturbation_nodes(inference_onnx,
                               output_path=output_onnx,
                               epsilon=epsilon,

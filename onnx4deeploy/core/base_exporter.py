@@ -729,31 +729,115 @@ class BaseONNXExporter(ABC):
         _, param_inputs = build_qzo_train_graph(net, self.paths["network_zo_train"], eps=eps, seed=seed)
         build_qzo_update_graph(net, self.paths["network_zo_update"], eps=eps, seed=seed)
 
-        # 5. fixture I/O: int8 input (from the pipeline) + real label + params; host L+/L-/grad ---------
-        int8_input = _np.load(out_dir / "inputs.npz")["input"]
-        label = _np.array([[real_label]], _np.int64)
-        go = ["loss", "log_prob"]
-        def _loss(eps_signed):
-            p, _ = build_qzo_train_graph(net, "/tmp/_qzo_pm.onnx", eps=eps_signed, seed=seed)
-            res = run_onnx_graph("/tmp/_qzo_pm.onnx", {"input": int8_input, "label": label, **param_inputs}, output_names=go)
-            L = float(next(_np.asarray(r).flatten()[0] for r in res if _np.asarray(r).size == 1))
-            lp = next(_np.asarray(r) for r in res if _np.asarray(r).size > 1)
-            return L, lp
-        Lp, lp = _loss(+eps); Lm, _ = _loss(-eps); grad = (Lp - Lm) / (2 * eps)
-        # QW: save inputs.npz with POSITIONAL arr_NNNN keys in GRAPH-INPUT ORDER — the float-ZO convention
+        # 5. fixture I/O + host reference ---------------------------------------------------------------
+        # QW: inputs.npz uses POSITIONAL arr_NNNN keys in GRAPH-INPUT ORDER — the float-ZO convention
         #     TrainDeeploy's testMVPTraining consumes (it sorts the base keys and maps them positionally to
         #     graph inputs input_0, input_1, ...). Parameter-name keys sort alphabetically ≠ graph order, so
         #     values load into the wrong buffers (e.g. BN γ/β read the conv weight/bias buffers → logits
         #     explode). -- QW
+        go = ["loss", "log_prob"]
         _ztrain_g = onnx.load(self.paths["network_zo_train"]).graph
-        _val_by_name = {"input": int8_input, "label": label, **param_inputs}
-        _ordered_inputs = {f"arr_{_gi:04d}": _val_by_name[_inp.name]
-                           for _gi, _inp in enumerate(_ztrain_g.input)}
-        _np.savez(_os.path.join(str(out_dir), "inputs.npz"), **_ordered_inputs)
-        _np.savez(_os.path.join(str(out_dir), "outputs.npz"),
-                  loss_plus=_np.float32(Lp), loss_minus=_np.float32(Lm), grad=_np.float32(grad), log_prob=lp)
-        print(f"✅ QZO export complete: {self.paths['network_zo_train']}")
-        print(f"   L+={Lp:.6f}  L-={Lm:.6f}  grad={grad:.6f}  log_prob argmax {int(_np.argmax(lp))} (label {real_label})")
+        input_order = [i.name for i in _ztrain_g.input]
+        data_size = int(self.config.get("data_size") or 1)
+        n_accum = int(self.config.get("n_accum") or 1)
+
+        if data_size <= 1:
+            # single-pair smoke fixture (exp7 behavior)
+            int8_input = _np.load(out_dir / "inputs.npz")["input"]
+            label = _np.array([[real_label]], _np.int64)
+            def _loss(eps_signed):
+                build_qzo_train_graph(net, "/tmp/_qzo_pm.onnx", eps=eps_signed, seed=seed)
+                res = run_onnx_graph("/tmp/_qzo_pm.onnx", {"input": int8_input, "label": label, **param_inputs}, output_names=go)
+                L = float(next(_np.asarray(r).flatten()[0] for r in res if _np.asarray(r).size == 1))
+                lp = next(_np.asarray(r) for r in res if _np.asarray(r).size > 1)
+                return L, lp
+            Lp, lp = _loss(+eps); Lm, _ = _loss(-eps); grad = (Lp - Lm) / (2 * eps)
+            _val_by_name = {"input": int8_input, "label": label, **param_inputs}
+            _np.savez(_os.path.join(str(out_dir), "inputs.npz"),
+                      **{f"arr_{_gi:04d}": _val_by_name[nm] for _gi, nm in enumerate(input_order)})
+            _np.savez(_os.path.join(str(out_dir), "outputs.npz"),
+                      loss_plus=_np.float32(Lp), loss_minus=_np.float32(Lm), grad=_np.float32(grad), log_prob=lp)
+            print(f"✅ QZO export complete: {self.paths['network_zo_train']}")
+            print(f"   L+={Lp:.6f}  L-={Lm:.6f}  grad={grad:.6f}  log_prob argmax {int(_np.argmax(lp))} (label {real_label})")
+            return self.paths["network_zo_train"]
+
+        # QW: MULTI-STEP fixture (--data-size N --n-accum A → n_steps = N/A device weight updates).
+        #     Host reference mirrors the device MeZO loop (deeploymezotest.c) EXACTLY:
+        #       per update step u: seed_base = u·q (q=1); L± via the int8 zo_train graph rebuilt with
+        #       seed=seed+seed_base and eps=±ε (feeding the CURRENT params — weights-as-inputs);
+        #       fp32 accumulation acc += (L+−L−); g_proj = acc/(2·ε·n_accum); coeff = −lr·g_proj;
+        #       update: int params via RQSPerturb with eps_ratio = coeff/ε (device kernels scale the baked
+        #       mul by perturb_eps_override/perturb_eps_baked, lrintf); float params (BN γ/β, fc) via the
+        #       float PerturbRademacher with eps = coeff. Same seed_base and node_id as the train passes
+        #       (zo_train/zo_update idx-consistency). -- QW
+        from onnx4deeploy.transform.qzo_transform import _iter_qzo_params
+        from onnx4deeploy.transform.qzo_weight_integerize import build_int8_forward as _bif
+        from onnx4deeploy.utils.onnx_node_implementations import _perturb_rqs_rademacher, _perturb_rademacher
+        lr = float(self.config.get("learning_rate") or 1e-5)
+        q = 1                                                   # runner --q 1 (q>1 not wired in the harness loop)
+        n_steps = max(1, data_size // max(n_accum, 1))
+        num_classes = self.config.get("num_classes", 2)
+        Xw_l, Yw_l = self.get_data_source().load_batches(data_size, (1,) + tuple(ishape[1:]), num_classes, seed=42)
+        Xw = [_np.asarray(a, _np.float32) for a in Xw_l]
+        Yw = [_np.asarray(l, _np.int64).reshape(1, 1) for l in Yw_l]
+        _meta_model, _meta_scale = _bif(onnx.load(net))
+        pmeta = list(_iter_qzo_params(_meta_model, _meta_scale))
+        P = {k: _np.asarray(v).copy() for k, v in param_inputs.items()}
+        all_lp, all_lm, gprojs, log_prob0 = [], [], [], None
+        print(f"   QZO multi-step sim: data_size={data_size} n_accum={n_accum} → n_steps={n_steps} "
+              f"lr={lr} eps={eps} seed={seed}")
+        for u in range(n_steps):
+            seed_eff = int(seed) + u * q                        # device: baked seed + perturb_seed_base(u·q)
+            build_qzo_train_graph(net, "/tmp/_qzo_p.onnx", eps=+eps, seed=seed_eff)
+            build_qzo_train_graph(net, "/tmp/_qzo_m.onnx", eps=-eps, seed=seed_eff)
+            acc = _np.float32(0.0)
+            for a in range(n_accum):
+                mb = (u * n_accum + a) % data_size
+                feed = {"input": Xw[mb], "label": Yw[mb], **P}
+                rp = run_onnx_graph("/tmp/_qzo_p.onnx", feed, output_names=go)
+                Lp = float(next(_np.asarray(r).flatten()[0] for r in rp if _np.asarray(r).size == 1))
+                if log_prob0 is None:
+                    log_prob0 = next(_np.asarray(r) for r in rp if _np.asarray(r).size > 1)
+                rm = run_onnx_graph("/tmp/_qzo_m.onnx", feed, output_names=go)
+                Lm = float(next(_np.asarray(r).flatten()[0] for r in rm if _np.asarray(r).size == 1))
+                all_lp.append(_np.float32(Lp)); all_lm.append(_np.float32(Lm))
+                acc = _np.float32(acc + (_np.float32(Lp) - _np.float32(Lm)))
+                print(f"     u{u} a{a} mb{mb}: L+={Lp:.6f} L-={Lm:.6f}")
+            # QW: replicate the device fp32 op ORDER exactly (ComputeZOUpdateCoeffOnCluster:
+            #     denom = 2.0f*ZO_EPS*n_accum left-assoc; coeff = -ZO_LR * g_proj) — a single fused
+            #     rounding differs by 1 ulp and shows up as ~1e-6 in the post-update losses. -- QW
+            _denom = _np.float32(_np.float32(_np.float32(2.0) * _np.float32(eps)) * _np.float32(n_accum))
+            g_proj = _np.float32(acc / _denom)
+            coeff = _np.float32(_np.float32(-lr) * g_proj)
+            ratio = float(_np.float32(coeff) / _np.float32(eps))   # device: override / eps_baked (fp32)
+            gprojs.append(float(g_proj))
+            print(f"     u{u}: acc={float(acc):.6f} g_proj={float(g_proj):.6f} coeff={float(coeff):.3e}")
+            for p in pmeta:
+                nm = p["name"]
+                if p["kind"] == "rqs":
+                    mul = _np.round(eps / p["scale"] * p["div"]).astype(_np.int32)   # == the baked *_pmul
+                    upd = _perturb_rqs_rademacher(P[nm], mul, seed_eff, p["idx"], p["div"], p["nlev"],
+                                                  1, sign=1, eps_ratio=ratio)
+                    P[nm] = _np.asarray(upd).reshape(P[nm].shape).astype(P[nm].dtype)
+                else:
+                    upd = _perturb_rademacher(P[nm].astype(_np.float32), seed_eff, p["idx"], float(coeff), 1)
+                    P[nm] = _np.asarray(upd).reshape(P[nm].shape).astype(_np.float32)
+
+        _val_by_name = {"input": Xw[0], "label": Yw[0], **param_inputs}
+        save = {f"arr_{_gi:04d}": _val_by_name[nm] for _gi, nm in enumerate(input_order)}
+        for k in range(1, data_size):                          # float-ZO mb-key convention
+            save[f"mb{k}_arr_0000"] = Xw[k]
+            save[f"mb{k}_arr_0001"] = Yw[k]
+        save["meta_data_size"] = _np.array([data_size], _np.int32)
+        save["meta_n_batches"] = _np.array([data_size], _np.int32)
+        save["meta_n_accum"] = _np.array([n_accum], _np.int32)
+        _np.savez(_os.path.join(str(out_dir), "inputs.npz"), **save)
+        outd = {"loss_plus": _np.array(all_lp, _np.float32), "loss_minus": _np.array(all_lm, _np.float32),
+                "grad": _np.array(gprojs, _np.float32), "log_prob": log_prob0}
+        outd.update({f"updated_{k}": v for k, v in P.items()})
+        _np.savez(_os.path.join(str(out_dir), "outputs.npz"), **outd)
+        print(f"✅ QZO multi-step export complete: {n_steps} update steps × {n_accum} accum "
+              f"({len(all_lp)} loss pairs); g_proj per step: {[round(g, 4) for g in gprojs]}")
         return self.paths["network_zo_train"]
 
     def create_training_test_data_zo(self) -> None:

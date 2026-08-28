@@ -222,6 +222,7 @@ def _perturb_rqs_rademacher(
     n_levels: int,
     signed: int,
     sign: int = 1,
+    eps_ratio: float = 1.0,
 ) -> np.ndarray:
     """RQS Rademacher perturbation for integer-quantised tensors."""
     flat = data.astype(np.int64).flatten()
@@ -229,6 +230,10 @@ def _perturb_rqs_rademacher(
     log2core = int(math.log2(NUM_CORES))
 
     mul_flat = mul.flatten().astype(np.int64)
+    if eps_ratio != 1.0:
+        # QW: zo_update coefficient — device kernels scale the baked mul by (override/baked eps) with
+        #     `lrintf((float)m * eps_scale)` (round-half-even). Mirror bit-for-bit: fp32 multiply + np.rint. -- QW
+        mul_flat = np.rint(mul_flat.astype(np.float32) * np.float32(eps_ratio)).astype(np.int64)
     num_out = mul_flat.size
     # QW: PER-OUTPUT-CHANNEL mul: element i uses M[i // elems_per_channel] — matches the fixed device kernel
     #     (M[(start_offset+i) / channel_width], channel_width = elements per output channel from the tile

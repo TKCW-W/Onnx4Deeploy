@@ -119,20 +119,28 @@ def _iter_qzo_params(model, scale_map):
     initmap = {i.name: i for i in model.graph.initializer}
     node_by_name = {n.name: n for n in model.graph.node}
     idx = 0
-    for n in model.graph.node:                                         # 1. int8 conv/fc weights + int32 biases
+    for n in model.graph.node:                                         # 1. CONV int8 weights + int32 biases
         if n.op_type not in ("Conv", "Gemm"):
             continue
         ent = scale_map.get(n.name)
         if ent is None:
             continue
-        if len(n.input) > 1 and n.input[1] in initmap:                 # int8 weight (Conv/Gemm input[1])
+        if n.op_type == "Gemm":                                        # FLOAT fc head (QMCUNetZO): quantize
+            for in_idx in (1, 2):                                      # Conv only; fc weight+bias are fp32,
+                if len(n.input) > in_idx and n.input[in_idx] in initmap:   # perturbed by float Rademacher.
+                    yield dict(kind="float", name=n.input[in_idx], idx=idx, in_idx=in_idx, node=n)
+                    idx += 1
+            continue
+        if len(n.input) > 1 and n.input[1] in initmap:                 # int8 conv weight (Conv input[1])
             yield dict(kind="rqs", name=n.input[1], scale=np.asarray(ent["weight_scale"], np.float64).reshape(-1),
                        div=DIV_W, nlev=NL_W, idx=idx, in_idx=1, node=n)
             idx += 1
-        if PERTURB_BIAS and len(n.input) > 2 and n.input[2] in initmap:  # int32 bias (Conv input[2], kept in conv)
-            yield dict(kind="rqs", name=n.input[2], scale=np.asarray(ent["bias_scale"], np.float64).reshape(-1),
-                       div=DIV_B, nlev=NL_B, idx=idx, in_idx=2, node=n)
-            idx += 1
+        if PERTURB_BIAS and "bias_rqs_name" in ent:                    # int32 conv bias in the RequantShift add
+            rqs = node_by_name.get(ent["bias_rqs_node"])
+            if rqs is not None and ent["bias_rqs_name"] in initmap:
+                yield dict(kind="rqs", name=ent["bias_rqs_name"], scale=np.asarray(ent["bias_scale"], np.float64).reshape(-1),
+                           div=DIV_B, nlev=NL_B, idx=idx, in_idx=2, node=rqs)
+                idx += 1
     for n in model.graph.node:                                         # 2. BN γ/β — fp32, float Rademacher
         if n.op_type != "BatchNormInternal":
             continue
@@ -140,10 +148,6 @@ def _iter_qzo_params(model, scale_map):
             if n.input[in_idx] in initmap:
                 yield dict(kind="float", name=n.input[in_idx], idx=idx, in_idx=in_idx, node=n)
                 idx += 1
-    fcadd = node_by_name.get("fc_bias_add")                            # 3. fc bias — fp32, float Rademacher
-    if fcadd is not None and len(fcadd.input) > 1 and fcadd.input[1] in initmap:
-        yield dict(kind="float", name=fcadd.input[1], idx=idx, in_idx=1, node=fcadd)
-        idx += 1
 
 
 def build_qzo_update_graph(quant_network_onnx: str, out_path: str, eps: float = 0.01, seed: int = 42):

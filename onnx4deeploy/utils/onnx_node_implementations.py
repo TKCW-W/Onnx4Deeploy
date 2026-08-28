@@ -230,9 +230,12 @@ def _perturb_rqs_rademacher(
 
     mul_flat = mul.flatten().astype(np.int64)
     num_out = mul_flat.size
-    # Tile mul to match C kernel: M[i % channel_width]
-    reps = (size + num_out - 1) // num_out if num_out > 0 else 1
-    mul_per_elem = np.tile(mul_flat, reps)[:size]
+    # QW: PER-OUTPUT-CHANNEL mul: element i uses M[i // elems_per_channel] — matches the fixed device kernel
+    #     (M[(start_offset+i) / channel_width], channel_width = elements per output channel from the tile
+    #     constraint). The previous np.tile (M[i % len(M)]) was channels-last semantics: wrong physics for
+    #     NCHW weights and inconsistent with the device (bias broadcast M[0]; weight read M o.o.b.). -- QW
+    elems_per_channel = max(1, size // num_out) if num_out > 0 else size
+    mul_per_elem = np.repeat(mul_flat, elems_per_channel)[:size]
 
     S = int(math.log2(div))
     rounding = np.int64(1 << (S - 1)) if S > 0 else np.int64(0)
@@ -824,7 +827,12 @@ def _exec_deeploy(op: str, inputs: List, attrs: Dict[str, Any], add_is_initializ
         signed = bool(attrs.get("signed", True))
         qmin = -(2 ** (bits-1)) if signed else 0
         qmax = (2 ** (bits-1)) - 1 if signed else (2**bits) - 1
-        return [np.clip(np.round(x / scale) + zp, qmin, qmax).astype(np.int8 if signed else np.uint8)]
+        # QW: match the device QuantTemplate rounding — `(int32_t)(v + 0.5f*(v>=0?1:-1))` = round-HALF-AWAY-
+        #     from-zero, NOT np.round's round-half-to-even. They differ at .5 boundaries → ±1 int8, which
+        #     accumulates over C>1 inter-block quant (block-0 C=1 hid it; block-1 diverges). -- QW
+        _v = x / scale
+        _q = np.trunc(_v + np.where(_v >= 0.0, 0.5, -0.5))
+        return [np.clip(_q + zp, qmin, qmax).astype(np.int8 if signed else np.uint8)]
 
     if op == "Dequant":
         q = inputs[0].astype(np.float64)

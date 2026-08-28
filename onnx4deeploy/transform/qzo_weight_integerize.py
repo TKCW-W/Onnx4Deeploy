@@ -305,15 +305,26 @@ def build_int8_forward(
         s_w = np.asarray(ent["weight_scale"], np.float64).reshape(-1)
         rqs = next((c for c in cons.get(n.output[0], []) if c.op_type == "RequantShift"), None)
         if rqs is not None:
-            # conv KEEPS its int32 bias (3-input: data_in, weight, bias). The Conv+RequantShift merge then
-            # yields a 5-input RequantizedConv (data_in, weight, bias, mul, add) — exactly what the shipped
-            # PULP int8 conv binding (PULPRQSConv2DBindings) expects. Per-channel RequantShift carries
-            # mul[c] = round(s_w[c]·s_in/s_out·div); add = 0 (the merge bakes the rounding). Weight AND bias
-            # are perturbed as CONV inputs (a variable weight/bias binds fine — the float ZO does the same). -- QW
+            # conv: per-channel RequantShift mul; the int32 bias moves from the Conv into the RequantShift
+            # `add`, so the Conv is 2-input (data_in, weight). This matches EVERY shipped PULP int8 conv
+            # (all `*_RQ` tests are 2-input, bias-in-add) and the int8 pulp_nn_conv kernel, which has no bias
+            # arg — the Conv+RequantShift merge then yields the canonical 4-input RequantizedConv
+            # (data_in, weight, mul, add). The `add` is a per-channel int32 variable → still ZO-perturbable.
+            # add[c] = round(s_w[c]·bias_int32[c]·div) = round(bias_fp32[c]·div/s_in); with s_in==s_out (all
+            # 1/128 for SpeechNet) this is the requant-add-domain bias round(bias_fp32·div/s_out). -- QW
             mul = np.round(s_w * (s_in / s_out) * div).astype(np.int32)
-            add = np.zeros(mul.shape, np.int32)
+            b_name = n.input[2] if len(n.input) > 2 else None
+            if b_name is not None and b_name in initmap:
+                b = numpy_helper.to_array(initmap[b_name]).astype(np.float64).reshape(-1)
+                add = np.round(s_w * b * div).astype(np.int32)         # int32 bias in RQS-add units
+                add_name = f"{ent['bias_src']}_rqsadd"
+                del n.input[2]                                         # Conv now 2-input (weight only)
+                ent["bias_rqs_name"] = add_name                       # perturbable int32 bias lives here
+                ent["bias_rqs_node"] = rqs.name
+            else:
+                add = np.zeros_like(mul); add_name = rqs.input[2] + "_pc"
             nm = numpy_helper.from_array(mul, name=rqs.input[1] + "_pc")
-            na = numpy_helper.from_array(add, name=rqs.input[2] + "_pc")
+            na = numpy_helper.from_array(add, name=add_name)
             rqs.input[1], rqs.input[2] = nm.name, na.name
             g.initializer.extend([nm, na])
             for a in list(rqs.attribute):
@@ -323,25 +334,34 @@ def build_int8_forward(
                 onnx.helper.make_attribute("div", numpy_helper.from_array(np.array(div, np.int64)))
             )
         elif n.output[0] in graph_outs:
-            # fc output layer: 2-input Gemm (int8 weight only) → per-channel dequant Mul → +fp32 bias.
-            # The bias moves OUT of the Gemm (device Gemm won't take a variable int32 bias) and becomes an
-            # fp32 Add after the dequant (float-perturbable later; a constant for this first device step). -- QW
-            s_fc = (s_in * s_w).astype(np.float32)
-            gemm_out = n.output[0] + "_int"
-            n.output[0] = gemm_out
-            sc = numpy_helper.from_array(s_fc, name="fc_dq_scale")
-            g.initializer.append(sc)
-            b_name = n.input[2] if len(n.input) > 2 else None
-            if b_name is not None and b_name in initmap:
+            # FLOAT fc (mirror the shipped QMCUNetZO ZO fixture: quantize the Conv layers only, keep the
+            # classifier Gemm in fp32). Dequantize the fc weight/bias back to plain fp32 initializers
+            # (perturbed later by float PerturbRademacher, exactly like BN γ/β) and bypass the fc input
+            # activation quant so the Gemm consumes the fp32 GAP/Reshape features → a clean 3-input float
+            # Gemm (data, weight, bias) → fp32 logits. int8 conv datapath + fp32 head = QMCUNetZO. -- QW
+            w_int8 = numpy_helper.to_array(initmap[n.input[1]]).astype(np.float64)
+            w_fp32 = (w_int8 * s_w.reshape([-1] + [1] * (w_int8.ndim - 1))).astype(np.float32)
+            wname = f"{ent['weight_src']}_fp32"
+            g.initializer.append(numpy_helper.from_array(w_fp32, name=wname))
+            n.input[1] = wname                                        # fp32 weight (float-perturbable)
+            if len(n.input) > 2 and n.input[2] in initmap:
                 s_b = np.asarray(ent["bias_scale"], np.float64).reshape(-1)
-                b_real = (numpy_helper.to_array(initmap[b_name]).astype(np.float64).reshape(-1) * s_b).astype(np.float32)
-                del n.input[2]                                         # Gemm now 2-input
-                br = numpy_helper.from_array(b_real, name=f"{ent['bias_src']}_real")
-                g.initializer.append(br)
-                g.node.append(onnx.helper.make_node("Mul", [gemm_out, sc.name], ["fc_dq"], name="fc_dequant_mul"))
-                g.node.append(onnx.helper.make_node("Add", ["fc_dq", br.name], ["output"], name="fc_bias_add"))
-            else:
-                g.node.append(onnx.helper.make_node("Mul", [gemm_out, sc.name], ["output"], name="fc_dequant_mul"))
+                b_fp32 = (numpy_helper.to_array(initmap[n.input[2]]).astype(np.float64).reshape(-1) * s_b).astype(np.float32)
+                bname = f"{ent['bias_src']}_fp32"
+                g.initializer.append(numpy_helper.from_array(b_fp32, name=bname))
+                n.input[2] = bname                                    # fp32 bias stays the Gemm's 3rd input
+            # bypass the fc input activation quant: walk back through the Quant/RequantShift chain to the
+            # first fp32 producer (Reshape/GAP) and feed that directly; the orphaned quant nodes get pruned.
+            _q = {"Quant", "Dequant", "RequantShift", "Clip", "Div", "Add", "Round", "Sub", "Mul"}
+            src, seen = n.input[0], set()
+            while src not in seen:
+                seen.add(src)
+                pr = next((p for p in g.node if src in p.output), None)
+                if pr is None or pr.op_type not in _q:
+                    break
+                src = pr.input[0]
+            n.input[0] = src                                          # fp32 features → float Gemm
+            # n.output[0] is already the graph output → Gemm emits fp32 logits directly (no Mul/Add).
 
     # Re-emit each unfolded fp32 BatchNormalization as BatchNormInternal (com.microsoft, training_mode=1,
     # 5 outputs) — the ORT training-mode BN, matching the float-ZO exp6 fixture. γ/β stay as inputs (promoted

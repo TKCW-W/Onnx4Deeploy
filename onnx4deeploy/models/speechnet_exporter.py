@@ -162,7 +162,10 @@ class SpeechNetExporter(BaseONNXExporter):
         if self.config.get("dataset", "random") == "silentwear":
             try:
                 ds = self.get_data_source()
-                X, _ = ds.load_batches(n, shape[1:], self.model_config["num_classes"], seed=42)
+                # QW: load_batches asserts each window == input_shape and the SilentWear source yields 4D
+                #     windows (1,1,C,T). Passing shape[1:]=(1,C,T) tripped the assert → silent random-calib
+                #     fallback (bad activation scales). Pass the full per-window shape (1,1,C,T). -- QW
+                X, _ = ds.load_batches(n, (1,) + tuple(shape[1:]), self.model_config["num_classes"], seed=42)
                 return np.asarray(X[:n], np.float32).reshape(shape)
             except Exception as e:
                 print(f"  calibration: silentwear unavailable ({e}); using random")

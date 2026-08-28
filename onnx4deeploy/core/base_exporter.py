@@ -697,7 +697,7 @@ class BaseONNXExporter(ABC):
         try:
             X, Y = self.get_data_source().load_batches(
                 max(int(self.config.get("calib_samples", 8)), self.config.get("num_classes", 2)),
-                ishape[1:], self.config["num_classes"], seed=42)
+                (1,) + tuple(ishape[1:]), self.config["num_classes"], seed=42)  # QW: 4D per-window (1,1,C,T)
             calib = _np.concatenate([_np.asarray(a, _np.float32) for a in X], 0).reshape(-1, *ishape[1:])
             real_label = int(_np.asarray(Y[0]).reshape(-1)[0])
         except Exception as _e:                                          # random fallback
@@ -740,7 +740,16 @@ class BaseONNXExporter(ABC):
             lp = next(_np.asarray(r) for r in res if _np.asarray(r).size > 1)
             return L, lp
         Lp, lp = _loss(+eps); Lm, _ = _loss(-eps); grad = (Lp - Lm) / (2 * eps)
-        _np.savez(_os.path.join(str(out_dir), "inputs.npz"), input=int8_input, label=label, **param_inputs)
+        # QW: save inputs.npz with POSITIONAL arr_NNNN keys in GRAPH-INPUT ORDER — the float-ZO convention
+        #     TrainDeeploy's testMVPTraining consumes (it sorts the base keys and maps them positionally to
+        #     graph inputs input_0, input_1, ...). Parameter-name keys sort alphabetically ≠ graph order, so
+        #     values load into the wrong buffers (e.g. BN γ/β read the conv weight/bias buffers → logits
+        #     explode). -- QW
+        _ztrain_g = onnx.load(self.paths["network_zo_train"]).graph
+        _val_by_name = {"input": int8_input, "label": label, **param_inputs}
+        _ordered_inputs = {f"arr_{_gi:04d}": _val_by_name[_inp.name]
+                           for _gi, _inp in enumerate(_ztrain_g.input)}
+        _np.savez(_os.path.join(str(out_dir), "inputs.npz"), **_ordered_inputs)
         _np.savez(_os.path.join(str(out_dir), "outputs.npz"),
                   loss_plus=_np.float32(Lp), loss_minus=_np.float32(Lm), grad=_np.float32(grad), log_prob=lp)
         print(f"✅ QZO export complete: {self.paths['network_zo_train']}")

@@ -183,6 +183,37 @@ Master's generality (conv weights genuinely train, 76% of them changed) buys no 
 round-1 accuracy on this task — the case for master weights rests on generality across
 tasks/rounds, not on this benchmark's round-1 number.
 
+## 4c · Direct-int8 lr sweep — a higher lr DOES overcome the stall (added 2026-09-02)
+
+`run_lr_sweep.py` + `run_lr_confirm.py`, direct int8, pooled@99.99, full round-1 protocol
+(2700 steps), batch-2 eval:
+
+| lr | b2 bal. acc | conv int8 changed | steps with any movement |
+|---|---|---|---|
+| 3e-6 (baseline) | 87.78% | 0.00% | 0% |
+| 6e-6 | 89.44% | 2.98% | 0.1% |
+| **1e-5** | **90.00 / 90.56 / 89.44%** (z-seeds 42/12345/67890) | 66–86% | 0.9–1.4% |
+| 2e-5 | 87.78% | 93.23% | 10.8% |
+| 3e-5 | 86.11% | 97.53% | 23.7% |
+| 6e-5 | 70.56% | 99.03% | 58.6% |
+| 1e-4 | 22.78% | 99.52% | 85.3% |
+| 3e-4 | 10.56% | 99.62% | 98.0% |
+
+**lr = 1e-5 is the stable un-stalled setting**: mean ≈ 90.0% over three independent z-seeds —
+above master-weight (87.2–88.3%) and the float-ZO round-1 reference (87.36%) — with graceful
+degradation on both sides. Mechanism: at 1e-5 only the rare large-|g| steps (~1%) clear the
+0.5 LSB threshold, so rounding acts as an implicit update-on-strong-signal-only filter (whole
+channels step ±1 LSB per event); at ≥2e-5 noisy steps clear it too and the int8 weights
+random-walk (monotone collapse). Note the max-update criterion, not the mean, is what predicts
+the onset: max|g|≈53 ⇒ first movement at lr ≈ 0.5·s_w_min/53 ≈ 6e-6, exactly as observed.
+
+Open at time of writing (runs interrupted by a host restart; scripts + incremental
+results.json committed, both resumable): `run_move_anatomy.py` (per-step movement anatomy at
+1e-5) and `run_ablate_frozen_w.py` (freeze int8 weights vs freeze BN+biases at 1e-5, to
+attribute the ~90% between int8-weight movement and BN+bias learning — at 6e-6, 89.44% with
+only 2.98% weights moved already hints most of the gain is BN+bias at higher lr; in this sim
+only BN γ/β are fp32, fc weight is int8, biases are int32 on the ~50× finer s_in·s_w grid).
+
 ## 5 · Verdict and what stands
 
 - **Calibration is refuted as the cause of the LSB stall** — now with the properly implemented

@@ -269,6 +269,34 @@ its own recipe lr (3e-6) vs QZO's tuned 1e-5 (a fair "each at its best lr" compa
 iso-lr one). The float model forward is batch-1 only (per-sample forward used; float zero-shot
 batch-2 = 81.67% cross-checks the sweep's float_ref exactly).
 
+## 4e · Why is quantized zero-shot > float zero-shot on batch 2? (added 2026-09-02, `run_quant_vs_float_zeroshot.py`)
+
+Batch-2 quantized zero-shot (85.56%) beats float (81.67%) by +3.89. Discriminating test —
+quant−float on in-distribution (pretraining sess 1+2) vs held-out (session 3), pretrained
+weights, no FT:
+
+| eval | quant | float | q−f |
+|---|---|---|---|
+| in-dist sess1 b1 | 95.56 | 95.00 | +0.56 |
+| in-dist sess1 b3 | 96.67 | 97.22 | −0.56 |
+| in-dist sess2 b2 | 90.00 | 95.00 | −5.00 |
+| held-out sess3 b2 | 85.56 | 81.67 | +3.89 |
+| held-out sess3 b3 | 78.33 | 76.67 | +1.67 |
+| held-out sess3 b4 | 87.22 | 87.78 | −0.56 |
+| **mean in-dist** | | | **−1.67** |
+| **mean held-out** | | | **+1.67** |
+
+The sign flips as the regularization hypothesis predicts: quantization slightly *hurts*
+in-distribution (lossy approx of weights already well-fit) and slightly *helps* held-out — the
+signature of trading fit for robustness. Mechanism is consistent with §2: pooled@99.99 clips the
+activation outlier tail, which on a shifted session was doing net harm. BUT the effect is small
+and batch-dependent (held-out wins span +3.89 → −0.56); batch 2 is the favorable end of the
+range, not a representative +4. Honest statement: **quantization is ~accuracy-neutral with a
+small (~+1.7 mean) held-out regularization benefit; the batch-2 +3.89 is that benefit at its
+high end, not a stable gain.** This reframes §4d: QZO doesn't out-learn float ZO — it starts from
+a marginally better-generalizing zero-shot and both fine-tune to the same 86.11% mean. Single
+fold; the +1.7 needs a multi-fold sweep to confirm as stable rather than a coin-flip.
+
 ## 5 · Verdict and what stands
 
 - **Calibration is refuted as the cause of the LSB stall** — now with the properly implemented

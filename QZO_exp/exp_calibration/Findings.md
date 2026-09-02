@@ -228,6 +228,47 @@ contribution from the int8 weight movement** — but only jointly: the weight mo
 without BN/bias co-adaptation, sits slightly below zero-shot. (+2.2 pt = 4 eval windows;
 directionally consistent with the 3-seed ~90% cluster for the full run vs 87.78%.)
 
+## 4d · Incremental fine-tuning, QZO direct@1e-5 vs float ZO (added 2026-09-02, `run_incremental.py`)
+
+Full incremental protocol, S01/vocalized/fold3, session 3. Rounds r=1..4: fine-tune on 54
+stratified windows (30% of 180, seed 42) from batch r, carry weights, evaluate on the WHOLE
+batch r+1 (180 windows). Recipe: 200 epochs × 54 / n_accum 4 = **2700 steps/round**, ε 0.01,
+z-seed restarts at 42 each round (mirrors the device runner). **QZO** = direct int8, lr 1e-5,
+act scales frozen at pooled@99.99 (pretraining calibration) and weight scales at pretrained
+per-channel abs-max — **both frozen across all rounds, no recalibration**. **Float ZO** = plain
+SpeechNet, lr 3e-6, eval-mode BN, all 22 tensors trainable — **same per-round fixtures**.
+
+| round | ft→eval | QZO before→after | float before→after | QZO−FP (after) | conv moved this round | cum net |
+|---|---|---|---|---|---|---|
+| 1 | b1→b2 | 85.56 → **90.00** | 81.67 → 87.78 | **+2.22** | 65.9% | 65.9% |
+| 2 | b2→b3 | 85.00 → 84.44 | 83.33 → 83.33 | +1.11 | 42.9% | 62.3% |
+| 3 | b3→b4 | 89.44 → 87.78 | 91.11 → 89.44 | −1.67 | 88.5% | 87.1% |
+| 4 | b4→b5 | 82.78 → 82.22 | 85.00 → 83.89 | −1.67 | 40.7% | 85.8% |
+| **mean after** | | **86.11** | **86.11** | **−0.00** | | union → 98.3% |
+
+Readings (honest):
+
+- **QZO matches float ZO on average** — mean post-FT balanced accuracy 86.11% for both, per-round
+  gap in [−1.67, +2.22], i.e. ≤ 3 eval windows either way. Quantized ZO with a tuned lr is not
+  measurably worse than float ZO on this task. This is the headline the supervisor asked for.
+- **The conv int8 weights genuinely train in every round** — 65.9 / 42.9 / 88.5 / 40.7% moved
+  per round, cumulative net 85.8% vs pretrained, union 98.3%. The strong-signal-filter mechanism
+  does **not** stall out as the model nears the session-3 distribution; the earlier worry that
+  direct@1e-5 was a round-1 artifact is refuted.
+- **Neither method reliably improves round-over-round** on this data — mean per-round Δ is small
+  and positive only in round 1 (QZO +0.42, float +0.83 averaged; both go flat/slightly-down in
+  rounds 2–4). That is a property of the *task/protocol* (30% single-batch FT on a near-converged
+  fold-3 checkpoint), shared by float ZO, not a quantization deficiency — the two track each
+  other round by round (e.g. both peak at round 3 eval on batch 4). It says the ceiling here is
+  the fine-tuning signal, not the weight representation.
+- Where they diverge is within the noise band and not systematic (QZO leads rounds 1–2, floats
+  leads 3–4). No evidence of drift/degradation specific to the int8 path across 4 rounds.
+
+Caveats: single subject/fold/seed; 180-window eval (1 window = 0.56%); host sim; float ZO uses
+its own recipe lr (3e-6) vs QZO's tuned 1e-5 (a fair "each at its best lr" comparison, not an
+iso-lr one). The float model forward is batch-1 only (per-sample forward used; float zero-shot
+batch-2 = 81.67% cross-checks the sweep's float_ref exactly).
+
 ## 5 · Verdict and what stands
 
 - **Calibration is refuted as the cause of the LSB stall** — now with the properly implemented

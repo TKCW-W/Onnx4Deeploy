@@ -207,12 +207,26 @@ channels step ±1 LSB per event); at ≥2e-5 noisy steps clear it too and the in
 random-walk (monotone collapse). Note the max-update criterion, not the mean, is what predicts
 the onset: max|g|≈53 ⇒ first movement at lr ≈ 0.5·s_w_min/53 ≈ 6e-6, exactly as observed.
 
-Open at time of writing (runs interrupted by a host restart; scripts + incremental
-results.json committed, both resumable): `run_move_anatomy.py` (per-step movement anatomy at
-1e-5) and `run_ablate_frozen_w.py` (freeze int8 weights vs freeze BN+biases at 1e-5, to
-attribute the ~90% between int8-weight movement and BN+bias learning — at 6e-6, 89.44% with
-only 2.98% weights moved already hints most of the gain is BN+bias at higher lr; in this sim
-only BN γ/β are fp32, fc weight is int8, biases are int32 on the ~50× finer s_in·s_w grid).
+**Movement anatomy at lr 1e-5** (`run_move_anatomy.py`, deterministic replay): 34 of 2700
+steps moved anything. Per moving step, 1.5–76.7% of the 14,880 conv weights (median 6.2%) —
+whole channels step ±1 LSB per event. |g| on moving steps: min 49.4 / median 55.6 / max 82.5,
+vs overall mean |g| ≈ 14.5 — only the extreme-|g| tail triggers movement. Union of ever-moved
+weights 76.81%; net changed vs init 65.93% (bounces cancel).
+
+**Attribution ablation at lr 1e-5** (`run_ablate_frozen_w.py`, same z/windows; in this sim
+only BN γ/β are fp32 — the fc weight is int8 like the convs, and conv/fc biases are int32 on
+the ~50× finer s_in·s_w grid, so biases clear their LSB even at 3e-6):
+
+| lr 1e-5 variant | b2 bal. acc |
+|---|---|
+| full direct (everything trains) | 90.00% |
+| int8 weights frozen — BN+biases only | 87.78% |
+| BN+biases frozen — int8 weights only | 84.44% (below the 85.56% zero-shot) |
+
+So the ~90% is **mostly BN+bias learning (87.78% on its own) plus a real ≈+2.2 pt
+contribution from the int8 weight movement** — but only jointly: the weight movement alone,
+without BN/bias co-adaptation, sits slightly below zero-shot. (+2.2 pt = 4 eval windows;
+directionally consistent with the 3-seed ~90% cluster for the full run vs 87.78%.)
 
 ## 5 · Verdict and what stands
 

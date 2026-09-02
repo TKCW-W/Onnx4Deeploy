@@ -265,13 +265,19 @@ Readings (honest):
   lr 3e-6, shared-z scalar accumulation, full model, frozen BN); its zero-shot row matches ours
   bit-for-bit.
 
-| batch | zero-shot float | my float ZO | exp18 float ZO | zero-shot quant | my QZO |
+| batch | zero-shot float | my float ZO | zero-shot quant | my QZO | QZO conv wts moved this round |
 |---|---|---|---|---|---|
-| b2 | 81.67 | 87.78 | 88.89 | 85.56 | 90.00 |
-| b3 | 76.67 | 83.33 | 85.00 | 78.33 | 84.44 |
-| b4 | 87.78 | 89.44 | 90.56 | 87.22 | 87.78 |
-| b5 | 76.11 | 83.89 | 85.00 | 77.22 | 82.22 |
-| **b2–5** | **80.56** | **86.11** | **87.36** | **82.08** | **86.11** |
+| b2 | 81.67 | 87.78 | 85.56 | 90.00 | 9,810 / 14,880 (65.9%) |
+| b3 | 76.67 | 83.33 | 78.33 | 84.44 | 6,377 / 14,880 (42.9%) |
+| b4 | 87.78 | 89.44 | 87.22 | 87.78 | 13,165 / 14,880 (88.5%) |
+| b5 | 76.11 | 83.89 | 77.22 | 82.22 | 6,055 / 14,880 (40.7%) |
+| **b2–5** | **80.56** | **86.11** | **82.08** | **86.11** | cum-net 85.8%, union 98.3% |
+
+(exp18 float-ZO reference for the same protocol: b2–5 = 87.36; discussion of the ~1.25 gap is
+in the bullets below.)
+
+(conv-weights-moved is the QZO int8 movement in the round trained on batch r−1 whose result is
+the b_r eval row; net within that round, out of 14,880 conv weights.)
 
 - **Apples-to-apples QZO == float ZO under the identical harness (86.11 = 86.11)**, both improving
   every batch. QZO pays nothing vs float ZO run the same way.
@@ -315,6 +321,37 @@ small (~+1.7 mean) held-out regularization benefit; the batch-2 +3.89 is that be
 high end, not a stable gain.** This reframes §4d: QZO doesn't out-learn float ZO — it starts from
 a marginally better-generalizing zero-shot and both fine-tune to the same 86.11% mean. Single
 fold; the +1.7 needs a multi-fold sweep to confirm as stable rather than a coin-flip.
+
+## 4f · Multi-seed confirmation (added 2026-09-02, `run_incremental_multiseed.py`, seeds 42/1/7/123)
+
+Same 4-round streaming protocol, pooled over 4 seeds (seed drives both the Rademacher z-stream
+and the 54-window stratified FT draw). Per-batch mean ± std (ddof=1), post-FT balanced accuracy:
+
+| method | b2 | b3 | b4 | b5 | b2–5 |
+|---|---|---|---|---|---|
+| float ZO (lr 3e-6) | 86.94 ± 0.72 | 83.75 ± 2.28 | 89.31 ± 1.46 | 84.17 ± 0.32 | **86.04** |
+| QZO int8 @ 1e-5 | 89.03 ± 1.15 | 84.17 ± 1.40 | 88.47 ± 1.23 | 82.22 ± 1.57 | **85.97** |
+
+Per-seed b2–5: float ZO {42:86.11, 1:85.56, 7:86.25, 123:86.25}; QZO {42:86.11, 1:85.83,
+7:84.72, 123:87.22}.
+
+Conclusions:
+
+- **QZO ≈ float ZO holds across seeds**: 85.97 vs 86.04 mean b2–5, a 0.07-pt gap — statistically
+  indistinguishable (both ≈ ±1 pt seed spread). Quantized ZO at lr 1e-5 costs nothing vs float ZO
+  under the identical harness. This is now a multi-seed result, not a single point.
+- **The ~1.25-pt gap to the exp18 reference (87.36) is real and NOT closed by seeds.** My float ZO
+  averages 86.04 ± ~0.35 across 4 seeds — it does *not* regress to exp18's 87.2 ± 0.3; the gap is
+  systematic, ~1.2 pt, concentrated on b3 (83.75 vs exp18 85.2) and b5 (84.17 vs 85.6). Since it
+  hits the float baseline equally, it is **not a quantization penalty** — it is a harness
+  difference between this study's float-ZO path and exp18's `zo_faithful.py`. Most likely the
+  Rademacher realization (numpy `RandomState` per-step vs exp18's device `_perturb_rademacher`
+  bitstream) or a minor FT-draw / step-count detail; exp18 §1 argues PRNG choice is accuracy-
+  neutral in expectation, so a persistent offset points at a small protocol detail worth a
+  code-level diff before quoting absolute numbers against exp18. For the QZO-vs-float question it
+  is immaterial — both sit on the same harness.
+- b3 remains the high-variance batch for both methods (std 2.28 / 1.40), matching exp18 §9's
+  finding that b3 is the structural weak/variable batch.
 
 ## 5 · Verdict and what stands
 

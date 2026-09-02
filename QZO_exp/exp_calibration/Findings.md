@@ -255,19 +255,38 @@ Readings (honest):
   per round, cumulative net 85.8% vs pretrained, union 98.3%. The strong-signal-filter mechanism
   does **not** stall out as the model nears the session-3 distribution; the earlier worry that
   direct@1e-5 was a round-1 artifact is refuted.
-- **Neither method reliably improves round-over-round** on this data — mean per-round Δ is small
-  and positive only in round 1 (QZO +0.42, float +0.83 averaged; both go flat/slightly-down in
-  rounds 2–4). That is a property of the *task/protocol* (30% single-batch FT on a near-converged
-  fold-3 checkpoint), shared by float ZO, not a quantization deficiency — the two track each
-  other round by round (e.g. both peak at round 3 eval on batch 4). It says the ceiling here is
-  the fine-tuning signal, not the weight representation.
-- Where they diverge is within the noise band and not systematic (QZO leads rounds 1–2, floats
-  leads 3–4). No evidence of drift/degradation specific to the int8 path across 4 rounds.
+- **Both methods improve on EVERY batch above the pretrained zero-shot baseline** (corrected —
+  an earlier draft here wrongly said "neither improves round-over-round", which measured the
+  *marginal* post-round-(r−1)→post-round-r delta, not the gain over the pretrained baseline). The
+  correct comparison, vs per-batch zero-shot (float / quant): b2 +6.1/+4.4, b3 +6.7/+6.1,
+  b4 +1.7/+0.6, b5 +7.8/+5.0. b4 gains least because its zero-shot is already ~87.8. This matches
+  the established float-ZO result in `SilentWear/.../exp18_zo_faithful_sim/FINDINGS.md`, whose
+  protocol is identical (streaming carry, train b_r → eval b_{r+1}, b1 untouched, 200 ep, ε 0.01,
+  lr 3e-6, shared-z scalar accumulation, full model, frozen BN); its zero-shot row matches ours
+  bit-for-bit.
 
-Caveats: single subject/fold/seed; 180-window eval (1 window = 0.56%); host sim; float ZO uses
-its own recipe lr (3e-6) vs QZO's tuned 1e-5 (a fair "each at its best lr" comparison, not an
-iso-lr one). The float model forward is batch-1 only (per-sample forward used; float zero-shot
-batch-2 = 81.67% cross-checks the sweep's float_ref exactly).
+| batch | zero-shot float | my float ZO | exp18 float ZO | zero-shot quant | my QZO |
+|---|---|---|---|---|---|
+| b2 | 81.67 | 87.78 | 88.89 | 85.56 | 90.00 |
+| b3 | 76.67 | 83.33 | 85.00 | 78.33 | 84.44 |
+| b4 | 87.78 | 89.44 | 90.56 | 87.22 | 87.78 |
+| b5 | 76.11 | 83.89 | 85.00 | 77.22 | 82.22 |
+| **b2–5** | **80.56** | **86.11** | **87.36** | **82.08** | **86.11** |
+
+- **Apples-to-apples QZO == float ZO under the identical harness (86.11 = 86.11)**, both improving
+  every batch. QZO pays nothing vs float ZO run the same way.
+- **My float ZO is ~1.25 below the exp18 reference (86.11 vs 87.36), consistently ~1.2/batch.**
+  vs exp18's multi-seed §9 (b2–5 = 87.2 ± 0.3, per-batch seed-std up to 3.4 on the weak batch b3),
+  my single run is low mainly on b3 (83.33 vs 85.2 ± 0.3) and b5. Likely cause: a different
+  Rademacher z-stream (numpy `RandomState(42+u)` vs exp18's device `_perturb_rademacher`) — a
+  single-seed realization unlucky on the hard streaming batches. It affects the float baseline
+  too, so it is a harness/RNG offset, not a quantization penalty. Open: 2–3 more seeds to confirm
+  the mean regresses toward 87.2 ± 0.3.
+
+Caveats: single subject/fold, single seed (RNG-stream-dependent, see above); 180-window eval
+(1 window = 0.56%); host sim; float ZO at its recipe lr 3e-6 vs QZO's tuned 1e-5 (each at its
+best lr). Float model forward is batch-1 only (per-sample forward used; float zero-shot
+batch-2 = 81.67% cross-checks the sweep's float_ref and exp18's zero-shot row exactly).
 
 ## 4e · Why is quantized zero-shot > float zero-shot on batch 2? (added 2026-09-02, `run_quant_vs_float_zeroshot.py`)
 

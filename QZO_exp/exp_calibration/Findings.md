@@ -158,6 +158,31 @@ lr ≈ 6e-5–1.2e-4, i.e. 20–40× the lr that fine-tuning tolerates (from
 `exp_masterweight_ft`: 3e-6 best; larger already degrades) — a calculation, not a tested
 regime.
 
+## 4b · Round-1 fine-tune at full length (added 2026-09-02, `run_round1.py`)
+
+Same simulation, full round-1 recipe (**2700 steps** = 200 epochs × 54 windows / n_accum 4,
+lr 3e-6, ε 0.01 — the exp18/exp5 recipe), batch-2 eval:
+
+| run | final b2 bal. acc | conv int8 changed | zero-move steps |
+|---|---|---|---|
+| **pooled@99.99 · direct** | **87.78%** | **0.00%** | 100% |
+| pooled@99.99 · master | 87.22% | 76.32% | 0.2% |
+| old54 · direct | 85.56% | 0.00% | 100% |
+| old54 · master | 88.33% | 76.51% | 0.3% |
+
+Context: float-ZO round-1 PyTorch sim = 87.36% (exp18), float zero-shot = 80.56%,
+quantized zero-shot pooled@99.99 = 85.56%.
+
+Reading (honest): at round-1 scale on this task, **direct-int8 matches master-weight and
+float ZO in accuracy** (all ≈ 87–88%, spread ≤ 1.1 pt ≈ 2 eval windows) — *while its conv
+int8 weights never move once in 2700 steps*. The adaptation this task needs is delivered
+by the fp32 BN γ/β + fc parameters alone. So "direct int8 ≈ float ZO" is reproduced here,
+but the movement counter shows it is BN/fc partial training in disguise, not int8 weights
+learning; the accuracy cost of the stall is not measurable in one round of this bench.
+Master's generality (conv weights genuinely train, 76% of them changed) buys no measurable
+round-1 accuracy on this task — the case for master weights rests on generality across
+tasks/rounds, not on this benchmark's round-1 number.
+
 ## 5 · Verdict and what stands
 
 - **Calibration is refuted as the cause of the LSB stall** — now with the properly implemented

@@ -703,8 +703,44 @@ class BaseONNXExporter(ABC):
         except Exception as _e:                                          # random fallback
             print(f"   (real data unavailable: {_e}; using random calibration)")
             calib = _np.random.randn(8, *ishape[1:]).astype(_np.float32); real_label = 0
-        with _torch.no_grad(), calibration_mode(model):
-            model(_torch.from_numpy(calib))
+        _pooled_json = _os.environ.get("QZO_POOLED_THRESHOLDS", "")
+        if _pooled_json:
+            # QW: exp9 — bake PRE-COMPUTED pooled-percentile activation thresholds instead of the
+            #     default few-window calibration_mode pass. File = {site_name: threshold}; the act
+            #     scale becomes threshold/128 (Int8ActPerTensorFloat int_scaling). Established by
+            #     QZO_exp/exp_calibration (pooled@99.99 over 1800 pretraining windows) — see its
+            #     Findings.md §2/§3. The original calibration is KEPT below (else branch). -- QW
+            import json as _json
+            _th = _json.load(open(_pooled_json))
+            from brevitas.proxy.runtime_quant import ActQuantProxyFromInjectorBase as _APB
+
+            class _ConstThreshold(_torch.nn.Module):
+                """Frozen scaling_impl: returns t, or t/int_threshold when one is passed
+                (RescalingIntQuant contract, brevitas core/quant/int.py:156-160)."""
+                def __init__(self, v):
+                    super().__init__()
+                    self.register_buffer("v", _torch.tensor(float(v), dtype=_torch.float32))
+
+                def forward(self, x=None, threshold=None, *a, **k):
+                    return self.v if threshold is None else self.v / threshold
+
+            _frozen = 0
+            for _mname, _mm in model.named_modules():
+                if isinstance(_mm, _APB) and getattr(_mm, "fused_activation_quant_proxy", None) \
+                        is not None and _mname in _th:
+                    _mm.fused_activation_quant_proxy.tensor_quant.scaling_impl = \
+                        _ConstThreshold(_th[_mname])
+                    with _torch.no_grad():
+                        _got, _want = float(_mm.scale()), _th[_mname] / 128.0
+                    assert abs(_got - _want) <= 1e-7 * max(abs(_want), 1e-30), \
+                        f"{_mname}: frozen act scale {_got!r} != {_want!r}"
+                    _frozen += 1
+            assert _frozen == len(_th), \
+                f"pooled-threshold site mismatch: froze {_frozen}/{len(_th)} sites"
+            print(f"   🧊 baked pooled act thresholds ({_frozen} sites) from {_pooled_json}")
+        else:
+            with _torch.no_grad(), calibration_mode(model):
+                model(_torch.from_numpy(calib))
         example = _torch.from_numpy(calib[:1].astype(_np.float32))
 
         # 2. exportBrevitas + create_quant_pipeline → integer network.onnx ------------------------------

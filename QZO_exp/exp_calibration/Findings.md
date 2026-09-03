@@ -353,6 +353,26 @@ Conclusions:
 - b3 remains the high-variance batch for both methods (std 2.28 / 1.40), matching exp18 §9's
   finding that b3 is the structural weak/variable batch.
 
+## 4g · Incremental at lr 3e-6 (stalled control), 4 seeds (added 2026-09-03, `run_incremental_3e6.py`)
+
+Same 4-round streaming protocol, direct int8 at lr **3e-6** (the stalled setting), seeds
+42/1/7/123. Conv int8 movement is **0.00 ± 0.00%** in every round (total stall confirmed at
+scale) — so this row is pure BN + int32-bias training, no conv-weight learning.
+
+| method | b2 | b3 | b4 | b5 | b2–5 | conv moved |
+|---|---|---|---|---|---|---|
+| QZO int8 @ 3e-6 (stalled) | 87.36 ± 0.53 | 80.28 ± 0.72 | 88.47 ± 0.53 | 82.92 ± 0.53 | **84.76** | 0.0% |
+| QZO int8 @ 1e-5 | 89.03 ± 1.15 | 84.17 ± 1.40 | 88.47 ± 1.23 | 82.22 ± 1.57 | **85.97** | 40–88%/round |
+| float ZO @ 3e-6 | 86.94 ± 0.72 | 83.75 ± 2.28 | 89.31 ± 1.46 | 84.17 ± 0.32 | **86.04** | (float) |
+
+Reading: **un-stalling the conv weights (3e-6 → 1e-5) buys +1.21 pt mean b2–5** (84.76 → 85.97),
+concentrated almost entirely on **b3** (+3.89: 80.28 → 84.17) — the hard streaming batch where
+conv-weight adaptation matters most; b2 also gains (+1.67). b4/b5 are flat-to-slightly-down
+within noise. So conv-weight training is not cosmetic: on the batch that most needs adaptation
+it recovers ~4 pt, lifting stalled-QZO (84.76, below float ZO's 86.04) up to parity with float
+ZO (85.97 ≈ 86.04). This is the clean quantitative case for making the conv weights move, on top
+of the movement-count evidence.
+
 ## 5 · Verdict and what stands
 
 - **Calibration is refuted as the cause of the LSB stall** — now with the properly implemented

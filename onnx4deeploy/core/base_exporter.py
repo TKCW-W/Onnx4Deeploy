@@ -811,7 +811,15 @@ class BaseONNXExporter(ABC):
         from onnx4deeploy.utils.onnx_node_implementations import _perturb_rqs_rademacher, _perturb_rademacher
         lr = float(self.config.get("learning_rate") or 1e-5)
         q = 1                                                   # runner --q 1 (q>1 not wired in the harness loop)
-        n_steps = max(1, data_size // max(n_accum, 1))
+        # QW: exp9 — cover the WHOLE round in the reference when the CLI asks for it
+        #     (--n-epochs E => n_batches = E*data_size rounded to n_accum => n_steps update
+        #     steps), matching the float-ZO fixture convention (exp5: outputs.npz carries all
+        #     21,600 reference losses and the device compares every pair). Without --n-epochs/
+        #     --n-batches the old behaviour stands: one pass over the window pool
+        #     (data_size // n_accum steps — e.g. exp8's 2-step smoke fixture). Windows always
+        #     cycle mb % data_size, so inputs.npz stays at data_size entries either way. -- QW
+        _nb = int(self.config.get("n_batches") or 0)
+        n_steps = max(max(1, data_size // max(n_accum, 1)), _nb // max(n_accum, 1))
         num_classes = self.config.get("num_classes", 2)
         Xw_l, Yw_l = self.get_data_source().load_batches(data_size, (1,) + tuple(ishape[1:]), num_classes, seed=42)
         Xw = [_np.asarray(a, _np.float32) for a in Xw_l]

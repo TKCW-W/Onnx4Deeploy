@@ -373,6 +373,33 @@ it recovers ~4 pt, lifting stalled-QZO (84.76, below float ZO's 86.04) up to par
 ZO (85.97 ≈ 86.04). This is the clean quantitative case for making the conv weights move, on top
 of the movement-count evidence.
 
+## 4h · Abspercentile on WEIGHT scales — does not help (added 2026-09-03, `run_weight_percentile.py`)
+
+Tested s_w[c] = percentile_p(|W[c]|)/127 instead of abs-max, p ∈ {100, 99.9, 99, 95}, act
+scales frozen at pooled@99.99. Round-1 (ft b1 → eval b2, seed 42):
+
+| weight scale | zero-shot | conv clipped | 3e-6 bal | 3e-6 moved | 1e-5 bal | 1e-5 moved |
+|---|---|---|---|---|---|---|
+| **abs-max (p100)** | 85.56 | 0% | 87.78 | 0% | **90.00** | 65.9% |
+| p99.9 | 85.56 | 5.6% | 88.89 | 0% | 88.89 | 76.5% |
+| p99 | 85.00 | 6.3% | 85.56 | 0% | 88.89 | 70.6% |
+| p95 | 85.56 | 9.3% | 87.22 | 0% | 87.22 | 87.1% |
+
+Conclusion: **weight abspercentile does not help; keep per-channel abs-max.**
+
+- **No un-stall at 3e-6**: conv moved = 0.0% at *every* percentile incl. p95. Percentile clipping
+  shrinks s_w only to ~0.6× (p95), lowering the finest-channel stall threshold from |g|≥164 to
+  ~97 — still above max observed |g|≈82. Bridging the 3e-6 gap needs s_w roughly halved, i.e.
+  clipping aggressive enough to destroy the weights. The finer-grid lever is real but far too
+  weak; only lr crosses the gap.
+- **At lr 1e-5, abs-max wins (90.00); more clipping is worse**: lower p → more conv movement
+  (65.9→87.1%) but lower accuracy (90.00→87.22). The clip cost (saturating 6–9% of the largest,
+  most salient weights) dominates the grid-fineness gain. Movement up, accuracy down.
+- Contrast with activations (§3), where percentile clipping *helps* because activations have a
+  fat outlier tail worth trimming; weights have no such tail, so abs-max is right.
+- The p99.9@3e-6 = 88.89 blip is not an un-stall (0% conv movement) — a small bias-grid/reg
+  effect, non-monotone (p99 → 85.56), i.e. noise.
+
 ## 5 · Verdict and what stands
 
 - **Calibration is refuted as the cause of the LSB stall** — now with the properly implemented

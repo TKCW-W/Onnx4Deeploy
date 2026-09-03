@@ -5761,5 +5761,103 @@
         "convw_union_ever_pct": 0.0
       }
     }
+  },
+  "weight_percentile": {
+    "p100": {
+      "pct": 100.0,
+      "zero_shot": 85.55555555555556,
+      "clip_pct": {
+        "blocks.0.conv.weight": 0.0,
+        "blocks.1.conv.weight": 0.0,
+        "blocks.2.conv.weight": 0.0,
+        "blocks.3.conv.weight": 0.0,
+        "blocks.4.conv.weight": 0.0,
+        "fc.weight": 0.0
+      },
+      "clip_conv_mean": 0.0,
+      "clip_fc": 0.0,
+      "lr3e-06": {
+        "bal": 87.77777777777777,
+        "conv_moved": 0.0,
+        "zero_move_steps": 100.0
+      },
+      "lr1e-05": {
+        "bal": 89.99999999999999,
+        "conv_moved": 65.9274193548387,
+        "zero_move_steps": 98.74074074074075
+      }
+    },
+    "p99.9": {
+      "pct": 99.9,
+      "zero_shot": 85.55555555555556,
+      "clip_pct": {
+        "blocks.0.conv.weight": 25.0,
+        "blocks.1.conv.weight": 0.78125,
+        "blocks.2.conv.weight": 0.78125,
+        "blocks.3.conv.weight": 0.8928571827709675,
+        "blocks.4.conv.weight": 0.44642859138548374,
+        "fc.weight": 3.125
+      },
+      "clip_conv_mean": 5.58035715483129,
+      "clip_fc": 3.125,
+      "lr3e-06": {
+        "bal": 88.88888888888889,
+        "conv_moved": 0.0,
+        "zero_move_steps": 100.0
+      },
+      "lr1e-05": {
+        "bal": 88.88888888888889,
+        "conv_moved": 76.47177419354838,
+        "zero_move_steps": 98.66666666666667
+      }
+    },
+    "p99": {
+      "pct": 99.0,
+      "zero_shot": 85.00000000000001,
+      "clip_pct": {
+        "blocks.0.conv.weight": 25.0,
+        "blocks.1.conv.weight": 1.5625,
+        "blocks.2.conv.weight": 1.5625,
+        "blocks.3.conv.weight": 1.785714365541935,
+        "blocks.4.conv.weight": 1.3392857275903225,
+        "fc.weight": 3.125
+      },
+      "clip_conv_mean": 6.2500000186264515,
+      "clip_fc": 3.125,
+      "lr3e-06": {
+        "bal": 85.55555555555556,
+        "conv_moved": 0.0,
+        "zero_move_steps": 100.0
+      },
+      "lr1e-05": {
+        "bal": 88.88888888888889,
+        "conv_moved": 70.59811827956989,
+        "zero_move_steps": 98.18518518518519
+      }
+    },
+    "p95": {
+      "pct": 95.0,
+      "zero_shot": 85.55555555555556,
+      "clip_pct": {
+        "blocks.0.conv.weight": 25.0,
+        "blocks.1.conv.weight": 5.46875,
+        "blocks.2.conv.weight": 5.46875,
+        "blocks.3.conv.weight": 5.35714291036129,
+        "blocks.4.conv.weight": 5.35714291036129,
+        "fc.weight": 6.25
+      },
+      "clip_conv_mean": 9.330357164144516,
+      "clip_fc": 6.25,
+      "lr3e-06": {
+        "bal": 87.22222222222223,
+        "conv_moved": 0.0,
+        "zero_move_steps": 100.0
+      },
+      "lr1e-05": {
+        "bal": 87.22222222222223,
+        "conv_moved": 87.11021505376344,
+        "zero_move_steps": 97.11111111111111
+      }
+    }
   }
 }

@@ -303,7 +303,50 @@ def build_int8_forward(
         if ent is None:
             continue
         s_w = np.asarray(ent["weight_scale"], np.float64).reshape(-1)
+        # QW: per-layer activation scales (2026-09-04). The uniform s_in==s_out assumption held
+        #     only for the OLD uncalibrated 1/128 scales; under the pooled@99.99 calibration the
+        #     per-tensor scales differ per layer (e.g. block0 in=22.297, out=13.1875 → ratio
+        #     1.69), and dropping the ratio distorts every block's output by s_in/s_out
+        #     (found via the Brevitas cross-check in exp9's build_qzo_infer_fixture: logit
+        #     cos 0.87 instead of ≈1). Trace THIS conv's input Quant scale and output Dequant
+        #     scale from the graph; fall back to the function args only if not found. -- QW
+        def _scale_attr(_nd):
+            for _a in _nd.attribute:
+                if _a.name == "scale":
+                    return float(onnx.helper.get_attribute_value(_a))
+            return None
+
+        _prod = {o: pn for pn in g.node for o in pn.output}
+        s_in_l, cur = None, n.input[0]
+        for _ in range(6):                       # walk up through pass-through ops to the Quant
+            pn = _prod.get(cur)
+            if pn is None:
+                break
+            if pn.op_type == "Quant":
+                s_in_l = _scale_attr(pn); break
+            if not pn.input:
+                break
+            cur = pn.input[0]
         rqs = next((c for c in cons.get(n.output[0], []) if c.op_type == "RequantShift"), None)
+        s_out_l = None
+        if rqs is not None:
+            cur = rqs.output[0]
+            for _ in range(6):                   # walk down to the Dequant
+                dn = next((c for c in cons.get(cur, [])), None)
+                if dn is None:
+                    break
+                if dn.op_type == "Dequant":
+                    s_out_l = _scale_attr(dn); break
+                if not dn.output:
+                    break
+                cur = dn.output[0]
+        if rqs is not None and (s_in_l is None or s_out_l is None):
+            # QW: only meaningful on the requantized (conv) path; the float-fc Gemm has no
+            #     RequantShift/Dequant to trace and never uses these values. -- QW
+            print(f"   ⚠ {n.name}: per-layer act scale not traced "
+                  f"(s_in={s_in_l}, s_out={s_out_l}) — falling back to uniform args")
+        _si = s_in_l if s_in_l is not None else s_in
+        _so = s_out_l if s_out_l is not None else s_out
         if rqs is not None:
             # conv: per-channel RequantShift mul; the int32 bias moves from the Conv into the RequantShift
             # `add`, so the Conv is 2-input (data_in, weight). This matches EVERY shipped PULP int8 conv
@@ -312,11 +355,13 @@ def build_int8_forward(
             # (data_in, weight, mul, add). The `add` is a per-channel int32 variable → still ZO-perturbable.
             # add[c] = round(s_w[c]·bias_int32[c]·div) = round(bias_fp32[c]·div/s_in); with s_in==s_out (all
             # 1/128 for SpeechNet) this is the requant-add-domain bias round(bias_fp32·div/s_out). -- QW
-            mul = np.round(s_w * (s_in / s_out) * div).astype(np.int32)
+            mul = np.round(s_w * (_si / _so) * div).astype(np.int32)   # QW: per-layer s_in/s_out
             b_name = n.input[2] if len(n.input) > 2 else None
             if b_name is not None and b_name in initmap:
                 b = numpy_helper.to_array(initmap[b_name]).astype(np.float64).reshape(-1)
-                add = np.round(s_w * b * div).astype(np.int32)         # int32 bias in RQS-add units
+                # QW: same per-layer ratio for the add — exact form add = b_int·mul_exact,
+                #     i.e. round(s_w·b_int·(s_in/s_out)·div) = round(b_fp32/s_out·div). -- QW
+                add = np.round(s_w * b * (_si / _so) * div).astype(np.int32)  # int32 bias in RQS-add units
                 add_name = f"{ent['bias_src']}_rqsadd"
                 del n.input[2]                                         # Conv now 2-input (weight only)
                 ent["bias_rqs_name"] = add_name                       # perturbable int32 bias lives here

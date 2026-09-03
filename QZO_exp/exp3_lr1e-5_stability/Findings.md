@@ -49,7 +49,7 @@ Per-batch (QZO / float, b2..b5):
   fold 2's distribution is shifted, so the same lr lands in the wrong regime. A fixed lr is
   therefore fragile across folds.
 
-## Conconclusion & recommendation
+## Conclusion & recommendation
 
 - lr 1e-5 direct-int8 QZO is a **valid but not robust** setting: it works where its threshold
   happens to sit at the |g| tail (folds 1, 3) and degrades where it does not (fold 2).

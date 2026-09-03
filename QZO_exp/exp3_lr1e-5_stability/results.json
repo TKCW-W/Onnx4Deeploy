@@ -1,0 +1,139 @@
+{
+  "stability": {
+    "fold1": {
+      "qzo": {
+        "round1": {
+          "train_batch": 1,
+          "eval_batch": 2,
+          "acc_before": 78.33333333333334,
+          "acc_after": 88.33333333333333,
+          "convw_moved_this_round_pct": 88.97849462365592,
+          "convw_net_cum_vs_pretrained_pct": 88.97849462365592,
+          "convw_union_ever_pct": 99.83870967741936
+        },
+        "round2": {
+          "train_batch": 2,
+          "eval_batch": 3,
+          "acc_before": 89.99999999999999,
+          "acc_after": 92.22222222222223,
+          "convw_moved_this_round_pct": 72.91666666666667,
+          "convw_net_cum_vs_pretrained_pct": 92.86290322580645,
+          "convw_union_ever_pct": 99.83870967741936
+        },
+        "round3": {
+          "train_batch": 3,
+          "eval_batch": 4,
+          "acc_before": 92.2222222222222,
+          "acc_after": 92.77777777777777,
+          "convw_moved_this_round_pct": 90.41666666666667,
+          "convw_net_cum_vs_pretrained_pct": 89.43548387096774,
+          "convw_union_ever_pct": 99.83870967741936
+        },
+        "round4": {
+          "train_batch": 4,
+          "eval_batch": 5,
+          "acc_before": 82.22222222222221,
+          "acc_after": 82.22222222222223,
+          "convw_moved_this_round_pct": 66.41129032258064,
+          "convw_net_cum_vs_pretrained_pct": 89.60349462365592,
+          "convw_union_ever_pct": 99.83870967741936
+        }
+      },
+      "fp": {
+        "round1": {
+          "train_batch": 1,
+          "eval_batch": 2,
+          "acc_before": 72.77777777777777,
+          "acc_after": 89.99999999999999
+        },
+        "round2": {
+          "train_batch": 2,
+          "eval_batch": 3,
+          "acc_before": 89.99999999999999,
+          "acc_after": 91.1111111111111
+        },
+        "round3": {
+          "train_batch": 3,
+          "eval_batch": 4,
+          "acc_before": 87.77777777777777,
+          "acc_after": 92.22222222222223
+        },
+        "round4": {
+          "train_batch": 4,
+          "eval_batch": 5,
+          "acc_before": 83.33333333333334,
+          "acc_after": 81.11111111111111
+        }
+      },
+      "seed": 42
+    },
+    "fold2": {
+      "qzo": {
+        "round1": {
+          "train_batch": 1,
+          "eval_batch": 2,
+          "acc_before": 70.0,
+          "acc_after": 77.22222222222223,
+          "convw_moved_this_round_pct": 90.53091397849462,
+          "convw_net_cum_vs_pretrained_pct": 90.53091397849462,
+          "convw_union_ever_pct": 99.83870967741936
+        },
+        "round2": {
+          "train_batch": 2,
+          "eval_batch": 3,
+          "acc_before": 82.22222222222223,
+          "acc_after": 78.8888888888889,
+          "convw_moved_this_round_pct": 92.81586021505376,
+          "convw_net_cum_vs_pretrained_pct": 95.29569892473118,
+          "convw_union_ever_pct": 99.83870967741936
+        },
+        "round3": {
+          "train_batch": 3,
+          "eval_batch": 4,
+          "acc_before": 78.88888888888889,
+          "acc_after": 76.66666666666667,
+          "convw_moved_this_round_pct": 62.35215053763441,
+          "convw_net_cum_vs_pretrained_pct": 95.63172043010752,
+          "convw_union_ever_pct": 99.83870967741936
+        },
+        "round4": {
+          "train_batch": 4,
+          "eval_batch": 5,
+          "acc_before": 77.22222222222224,
+          "acc_after": 75.55555555555556,
+          "convw_moved_this_round_pct": 94.17338709677419,
+          "convw_net_cum_vs_pretrained_pct": 95.71908602150538,
+          "convw_union_ever_pct": 99.89247311827957
+        }
+      },
+      "fp": {
+        "round1": {
+          "train_batch": 1,
+          "eval_batch": 2,
+          "acc_before": 69.44444444444444,
+          "acc_after": 81.66666666666667
+        },
+        "round2": {
+          "train_batch": 2,
+          "eval_batch": 3,
+          "acc_before": 86.11111111111111,
+          "acc_after": 83.33333333333334
+        },
+        "round3": {
+          "train_batch": 3,
+          "eval_batch": 4,
+          "acc_before": 80.0,
+          "acc_after": 80.55555555555556
+        },
+        "round4": {
+          "train_batch": 4,
+          "eval_batch": 5,
+          "acc_before": 79.44444444444446,
+          "acc_after": 82.22222222222223
+        }
+      },
+      "seed": 42
+    }
+  },
+  "stability_summary_written": true
+}

@@ -5287,5 +5287,139 @@
       7,
       123
     ]
+  },
+  "per_tensor_move_1e5": {
+    "blocks.0.conv.weight": {
+      "kind": "quant",
+      "n": 32,
+      "moved": 4,
+      "pct": 12.5
+    },
+    "blocks.0.conv.bias": {
+      "kind": "quant",
+      "n": 8,
+      "moved": 0,
+      "pct": 0.0
+    },
+    "blocks.1.conv.weight": {
+      "kind": "quant",
+      "n": 2048,
+      "moved": 1797,
+      "pct": 87.744140625
+    },
+    "blocks.1.conv.bias": {
+      "kind": "quant",
+      "n": 16,
+      "moved": 16,
+      "pct": 100.0
+    },
+    "blocks.2.conv.weight": {
+      "kind": "quant",
+      "n": 2048,
+      "moved": 702,
+      "pct": 34.27734375
+    },
+    "blocks.2.conv.bias": {
+      "kind": "quant",
+      "n": 16,
+      "moved": 16,
+      "pct": 100.0
+    },
+    "blocks.3.conv.weight": {
+      "kind": "quant",
+      "n": 3584,
+      "moved": 1871,
+      "pct": 52.20424107142857
+    },
+    "blocks.3.conv.bias": {
+      "kind": "quant",
+      "n": 32,
+      "moved": 32,
+      "pct": 100.0
+    },
+    "blocks.4.conv.weight": {
+      "kind": "quant",
+      "n": 7168,
+      "moved": 5436,
+      "pct": 75.83705357142857
+    },
+    "blocks.4.conv.bias": {
+      "kind": "quant",
+      "n": 32,
+      "moved": 32,
+      "pct": 100.0
+    },
+    "fc.weight": {
+      "kind": "quant",
+      "n": 288,
+      "moved": 0,
+      "pct": 0.0
+    },
+    "fc.bias": {
+      "kind": "quant",
+      "n": 9,
+      "moved": 9,
+      "pct": 100.0
+    },
+    "blocks.0.bn.weight": {
+      "kind": "float",
+      "n": 8,
+      "moved": 8,
+      "pct": 100.0
+    },
+    "blocks.0.bn.bias": {
+      "kind": "float",
+      "n": 8,
+      "moved": 8,
+      "pct": 100.0
+    },
+    "blocks.1.bn.weight": {
+      "kind": "float",
+      "n": 16,
+      "moved": 16,
+      "pct": 100.0
+    },
+    "blocks.1.bn.bias": {
+      "kind": "float",
+      "n": 16,
+      "moved": 16,
+      "pct": 100.0
+    },
+    "blocks.2.bn.weight": {
+      "kind": "float",
+      "n": 16,
+      "moved": 16,
+      "pct": 100.0
+    },
+    "blocks.2.bn.bias": {
+      "kind": "float",
+      "n": 16,
+      "moved": 16,
+      "pct": 100.0
+    },
+    "blocks.3.bn.weight": {
+      "kind": "float",
+      "n": 32,
+      "moved": 32,
+      "pct": 100.0
+    },
+    "blocks.3.bn.bias": {
+      "kind": "float",
+      "n": 32,
+      "moved": 32,
+      "pct": 100.0
+    },
+    "blocks.4.bn.weight": {
+      "kind": "float",
+      "n": 32,
+      "moved": 32,
+      "pct": 100.0
+    },
+    "blocks.4.bn.bias": {
+      "kind": "float",
+      "n": 32,
+      "moved": 32,
+      "pct": 100.0
+    }
   }
 }

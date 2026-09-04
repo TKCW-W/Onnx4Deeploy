@@ -830,19 +830,47 @@ class BaseONNXExporter(ABC):
         all_lp, all_lm, gprojs, log_prob0 = [], [], [], None
         print(f"   QZO multi-step sim: data_size={data_size} n_accum={n_accum} → n_steps={n_steps} "
               f"lr={lr} eps={eps} seed={seed}")
+        # QW: build the ±ε graphs ONCE, then per step patch ONLY the perturb nodes' `seed`
+        #     attribute in-memory and re-save (a ~ms protobuf write). The previous per-step
+        #     build_qzo_train_graph pair re-ran the FULL integerization (load + build_int8_forward
+        #     + shape-annotation dummy run + save) twice per update step and dominated the
+        #     multi-step reference time (~20 s/step → ~15 h for a 2700-step round). Nothing else
+        #     in the graphs depends on the step: eps sign/lr are baked once, only seed_eff varies
+        #     (device analogue: runtime perturb_seed_base, no rebuild there either). Gate:
+        #     verified bit-identical outputs.npz on the 13-step fixture before first use. -- QW
+        # QW: UNIQUE temp paths — the fixed /tmp/_qzo_{p,m}.onnx names caused a race when two
+        #     exports ran concurrently (each overwrote the other's sim graphs mid-run; found via
+        #     a corrupted seed-patch gate run 2026-09-04). -- QW
+        import tempfile as _tf
+        _qzo_tmpdir = _tf.mkdtemp(prefix="qzo_sim_")
+        _QP = _os.path.join(_qzo_tmpdir, "qzo_p.onnx")
+        _QM = _os.path.join(_qzo_tmpdir, "qzo_m.onnx")
+        build_qzo_train_graph(net, _QP, eps=+eps, seed=int(seed))
+        build_qzo_train_graph(net, _QM, eps=-eps, seed=int(seed))
+        _mp_proto = onnx.load(_QP)
+        _mm_proto = onnx.load(_QM)
+        _PERT_OPS = ("RQSPerturbRademacher", "PerturbRademacher")
+
+        def _patch_seed(_model, _sd):
+            for _pn in _model.graph.node:
+                if _pn.op_type in _PERT_OPS:
+                    for _pa in _pn.attribute:
+                        if _pa.name == "seed":
+                            _pa.i = int(_sd)
+
         for u in range(n_steps):
             seed_eff = int(seed) + u * q                        # device: baked seed + perturb_seed_base(u·q)
-            build_qzo_train_graph(net, "/tmp/_qzo_p.onnx", eps=+eps, seed=seed_eff)
-            build_qzo_train_graph(net, "/tmp/_qzo_m.onnx", eps=-eps, seed=seed_eff)
+            _patch_seed(_mp_proto, seed_eff); onnx.save(_mp_proto, _QP)
+            _patch_seed(_mm_proto, seed_eff); onnx.save(_mm_proto, _QM)
             acc = _np.float32(0.0)
             for a in range(n_accum):
                 mb = (u * n_accum + a) % data_size
                 feed = {"input": Xw[mb], "label": Yw[mb], **P}
-                rp = run_onnx_graph("/tmp/_qzo_p.onnx", feed, output_names=go)
+                rp = run_onnx_graph(_QP, feed, output_names=go)
                 Lp = float(next(_np.asarray(r).flatten()[0] for r in rp if _np.asarray(r).size == 1))
                 if log_prob0 is None:
                     log_prob0 = next(_np.asarray(r) for r in rp if _np.asarray(r).size > 1)
-                rm = run_onnx_graph("/tmp/_qzo_m.onnx", feed, output_names=go)
+                rm = run_onnx_graph(_QM, feed, output_names=go)
                 Lm = float(next(_np.asarray(r).flatten()[0] for r in rm if _np.asarray(r).size == 1))
                 all_lp.append(_np.float32(Lp)); all_lm.append(_np.float32(Lm))
                 acc = _np.float32(acc + (_np.float32(Lp) - _np.float32(Lm)))

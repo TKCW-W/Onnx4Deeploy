@@ -1,0 +1,200 @@
+{
+ "blocks.0.conv.weight_int8": {
+  "kind": "int",
+  "mean_abs_step": 3.65625,
+  "max_abs_step": 7.0,
+  "antithetic": false,
+  "frac_pos": 0.375,
+  "n_zero": 1,
+  "n": 32
+ },
+ "blocks.0.conv.bias_rqsadd": {
+  "kind": "int",
+  "mean_abs_step": 0.0,
+  "max_abs_step": 0.0,
+  "antithetic": true,
+  "frac_pos": 0.0,
+  "n_zero": 8,
+  "n": 8
+ },
+ "blocks.1.conv.weight_int8": {
+  "kind": "int",
+  "mean_abs_step": 7.51953125,
+  "max_abs_step": 9.0,
+  "antithetic": false,
+  "frac_pos": 0.5029296875,
+  "n_zero": 9,
+  "n": 2048
+ },
+ "blocks.1.conv.bias_rqsadd": {
+  "kind": "int",
+  "mean_abs_step": 42.5,
+  "max_abs_step": 51.0,
+  "antithetic": true,
+  "frac_pos": 0.5625,
+  "n_zero": 0,
+  "n": 16
+ },
+ "blocks.2.conv.weight_int8": {
+  "kind": "int",
+  "mean_abs_step": 5.85009765625,
+  "max_abs_step": 9.0,
+  "antithetic": false,
+  "frac_pos": 0.50341796875,
+  "n_zero": 8,
+  "n": 2048
+ },
+ "blocks.2.conv.bias_rqsadd": {
+  "kind": "int",
+  "mean_abs_step": 63.4375,
+  "max_abs_step": 92.0,
+  "antithetic": true,
+  "frac_pos": 0.6875,
+  "n_zero": 0,
+  "n": 16
+ },
+ "blocks.3.conv.weight_int8": {
+  "kind": "int",
+  "mean_abs_step": 6.532366071428571,
+  "max_abs_step": 8.0,
+  "antithetic": false,
+  "frac_pos": 0.5005580357142857,
+  "n_zero": 14,
+  "n": 3584
+ },
+ "blocks.3.conv.bias_rqsadd": {
+  "kind": "int",
+  "mean_abs_step": 58.6875,
+  "max_abs_step": 76.0,
+  "antithetic": true,
+  "frac_pos": 0.34375,
+  "n_zero": 0,
+  "n": 32
+ },
+ "blocks.4.conv.weight_int8": {
+  "kind": "int",
+  "mean_abs_step": 7.414760044642857,
+  "max_abs_step": 10.0,
+  "antithetic": false,
+  "frac_pos": 0.49776785714285715,
+  "n_zero": 17,
+  "n": 7168
+ },
+ "blocks.4.conv.bias_rqsadd": {
+  "kind": "int",
+  "mean_abs_step": 130.21875,
+  "max_abs_step": 177.0,
+  "antithetic": true,
+  "frac_pos": 0.46875,
+  "n_zero": 0,
+  "n": 32
+ },
+ "fc.weight_fp32": {
+  "kind": "float",
+  "mean_abs_step": 0.009999995263771981,
+  "max_abs_step": 0.01000000536441803,
+  "antithetic": true,
+  "frac_pos": 0.5416666666666666,
+  "n_zero": 0,
+  "n": 288
+ },
+ "fc.bias_fp32": {
+  "kind": "float",
+  "mean_abs_step": 0.010000001639127731,
+  "max_abs_step": 0.01000000536441803,
+  "antithetic": true,
+  "frac_pos": 0.3333333333333333,
+  "n_zero": 0,
+  "n": 9
+ },
+ "blocks.0.bn.weight": {
+  "kind": "float",
+  "mean_abs_step": 0.009999990463256836,
+  "max_abs_step": 0.009999990463256836,
+  "antithetic": true,
+  "frac_pos": 0.5,
+  "n_zero": 0,
+  "n": 8
+ },
+ "blocks.0.bn.bias": {
+  "kind": "float",
+  "mean_abs_step": 0.01000000024214387,
+  "max_abs_step": 0.01000000536441803,
+  "antithetic": true,
+  "frac_pos": 0.5,
+  "n_zero": 0,
+  "n": 8
+ },
+ "blocks.1.bn.weight": {
+  "kind": "float",
+  "mean_abs_step": 0.009999990463256836,
+  "max_abs_step": 0.009999990463256836,
+  "antithetic": true,
+  "frac_pos": 0.5625,
+  "n_zero": 0,
+  "n": 16
+ },
+ "blocks.1.bn.bias": {
+  "kind": "float",
+  "mean_abs_step": 0.01000000030035153,
+  "max_abs_step": 0.01000000536441803,
+  "antithetic": true,
+  "frac_pos": 0.5,
+  "n_zero": 0,
+  "n": 16
+ },
+ "blocks.2.bn.weight": {
+  "kind": "float",
+  "mean_abs_step": 0.009999990463256836,
+  "max_abs_step": 0.009999990463256836,
+  "antithetic": true,
+  "frac_pos": 0.6875,
+  "n_zero": 0,
+  "n": 16
+ },
+ "blocks.2.bn.bias": {
+  "kind": "float",
+  "mean_abs_step": 0.009999999165302143,
+  "max_abs_step": 0.010000001639127731,
+  "antithetic": true,
+  "frac_pos": 0.4375,
+  "n_zero": 0,
+  "n": 16
+ },
+ "blocks.3.bn.weight": {
+  "kind": "float",
+  "mean_abs_step": 0.009999990463256836,
+  "max_abs_step": 0.009999990463256836,
+  "antithetic": true,
+  "frac_pos": 0.46875,
+  "n_zero": 0,
+  "n": 32
+ },
+ "blocks.3.bn.bias": {
+  "kind": "float",
+  "mean_abs_step": 0.009999999798310455,
+  "max_abs_step": 0.01000000536441803,
+  "antithetic": true,
+  "frac_pos": 0.5625,
+  "n_zero": 0,
+  "n": 32
+ },
+ "blocks.4.bn.weight": {
+  "kind": "float",
+  "mean_abs_step": 0.009999990463256836,
+  "max_abs_step": 0.009999990463256836,
+  "antithetic": true,
+  "frac_pos": 0.53125,
+  "n_zero": 0,
+  "n": 32
+ },
+ "blocks.4.bn.bias": {
+  "kind": "float",
+  "mean_abs_step": 0.010000000707805157,
+  "max_abs_step": 0.01000000536441803,
+  "antithetic": true,
+  "frac_pos": 0.625,
+  "n_zero": 0,
+  "n": 32
+ }
+}

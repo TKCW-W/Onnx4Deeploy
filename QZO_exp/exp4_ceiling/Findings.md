@@ -58,6 +58,30 @@ of the evidence (no magnitude fidelity). Note stochastic rounding — the *unbia
 version of the same wish (E[δ]=u) — already degraded accuracy in our earlier test; ceiling is
 strictly more biased (E[δ] ≈ sign(u)·1 for sub-LSB u) and correspondingly worse.
 
+## SR control under the same protocol (added same day, `sr_control/run_sr.py`)
+
+Stochastic rounding (`δ = floor(u) + Bernoulli(frac(u))`, unbiased, zero memory) re-run under
+the identical canonical protocol (lr 3e-6, 2700 steps, pooled@99.99, seeded draws) — the
+earlier-era rejection re-tested fairly:
+
+| metric | SR @ 3e-6 |
+|---|---|
+| moving steps | 2696/2700, but only **~2.6% of weights per step** (≈ mean frac(u) — unbiasedness confirmed empirically) |
+| cumulative net / union | 95.0% / 100% |
+| b2 trajectory | 85.56 → **87.78 (peak @675)** → 87.22 → 86.11 → **85.00 final** |
+
+Reading: far better than ceiling (unbiasedness matters: 85.0 vs 51.7) and roughly
+accuracy-neutral vs zero-shot — but **still ~2.8 pts below plain rounding at the same lr**
+(87.78%, conv frozen, BN+bias learning intact). The comparison isolates the cost cleanly: SR
+gets the identical BN+bias learning *plus* conv-weight coin-flip noise, and the noise eats the
+gains; the decaying trajectory after the step-675 peak shows the variance accumulating with
+training length. Rejection upheld under the current protocol — now with the nuance that SR is
+benign-but-useless rather than harmful, sitting between round (better) and ceiling (far worse).
+
+Final memoryless-rules ranking @ 3e-6, one round, identical harness:
+**round 87.78 > SR 85.00 (≈ zero-shot 85.56) ≫ ceil 51.67** — and round@tuned-1e-5 (90.00)
+beats them all.
+
 ## Verdict
 
 Abs-ceiling is refuted as a stall remedy: it converts the stall into aggressive noise injection

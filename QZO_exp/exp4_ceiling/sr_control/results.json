@@ -1,0 +1,12 @@
+{
+ "lr": 3e-06,
+ "steps": 2700,
+ "zero_shot": 85.55555555555556,
+ "final_b2": 85.00000000000001,
+ "overall": 85.0,
+ "moving_steps": 2696,
+ "pct_moving_steps": 99.85185185185185,
+ "mean_moved_per_step_pct": 2.577660792512943,
+ "net_changed_pct": 95.00672043010752,
+ "union_ever_pct": 100.0
+}

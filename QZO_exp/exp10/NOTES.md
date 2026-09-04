@@ -72,8 +72,28 @@ before the shift in the RQS path regardless of whether the bias is baked. This i
 RequantShift-kernel change + the host reference to match (env hook `QZO_FORCE_REQUANT_ROUND`
 added to `run_onnx_graph` as the diagnostic).
 
-Confirmation in progress: full round-1 B-host with rounding -> batch-2 accuracy (expect recovery
-toward ~88%). Then port the rounding to the device kernel + re-run bit-exactness.
+### CONFIRMED (iteration 3): rounding recovers accuracy
+
+True integer datapath, host reference, batch 2:
+
+| datapath | zero-shot | trained | Δ |
+|---|---|---|---|
+| **truncate** (current, 200 ep) | 85.00 | **83.89** | −1.11 (worse) |
+| **round** (fixed, 50 ep) | 85.00 | **87.22** | **+2.22** (improves) |
+
+Rounding flips the integer datapath from training DOWN to training UP. 87.22% @ 50 epochs ==
+Brevitas @ 50 epochs; the 88.89% (200 ep) is now reachable on the real datapath. **Truncation was
+the entire accuracy bug.** The whole investigation resolves to a one-line requant fix.
+
+### Remaining work (deployment)
+1. Full 200-epoch rounded host run -> confirm ~88% (in progress).
+2. **Port rounding to the DEVICE RequantShift kernel** — the kernel truncates a variable-add
+   requant; add `2^(d-1)` before the `>>d`. Then the host reference (already has the diagnostic
+   env hook) is promoted to unconditional rounding, and re-run single-step + full bit-exactness.
+3. Re-run the on-device round-1 with the fixed kernel -> device accuracy ~88%, bit-exact vs the
+   rounded host reference.
+
+### (superseded) earlier next-steps
 
 ### (superseded) earlier next-steps
 - Trace the SHIPPED `Onnx4Deeploy_ZO` QZO reference path entry→output: how does IT compute the

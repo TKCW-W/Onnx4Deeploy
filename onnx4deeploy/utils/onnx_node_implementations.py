@@ -20,6 +20,7 @@ Supported op domains:
 from __future__ import annotations
 
 import math
+import os as _os          # -- QW exp10 diagnostic (QZO_FORCE_REQUANT_ROUND)
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -889,7 +890,7 @@ def _exec_deeploy(op: str, inputs: List, attrs: Dict[str, Any], add_is_initializ
         # Only add rounding when add is a constant initializer.
         # For RQSRad, add comes from a perturbation node (not an initializer),
         # so the C merge pass cannot bake rounding in -> kernel just truncates.
-        if add_is_initializer:
+        if add_is_initializer or _os.environ.get("QZO_FORCE_REQUANT_ROUND"):  # -- QW exp10 diagnostic
             rounding = np.int32(1 << (log2D - 1)) if log2D > 0 else np.int32(0)
         else:
             rounding = np.int32(0)

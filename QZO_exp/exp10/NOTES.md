@@ -94,8 +94,6 @@ the entire accuracy bug.** The whole investigation resolves to a one-line requan
    rounded host reference.
 
 ### (superseded) earlier next-steps
-
-### (superseded) earlier next-steps
 - Trace the SHIPPED `Onnx4Deeploy_ZO` QZO reference path entry→output: how does IT compute the
   int8 forward + reference loss? Compare requant semantics (round vs truncate, fixed-point,
   per-channel) against our B and against Brevitas A.
@@ -124,3 +122,24 @@ both compute `(acc*mul + bias+rounding + noise) >> d` → round, consistently �
 correct. `QZO_FORCE_REQUANT_ROUND` was the DIAGNOSTIC; the shipped fix is the baked constant.
 
 Verify after: single-step device bit-exactness (rounded), then full round-1 device run + accuracy.
+
+---
+
+## Iteration 5 (2026-09-05) — FIX SHIPPED (host-verified)
+
+`qzo_weight_integerize.build_int8_forward`: bake `div//2` into the conv `bias_rqsadd`
+initializer. The variable add now carries the rounding constant, so BOTH the device kernel
+`pulp_nn_bn_quant_i8` and the host `run_onnx_graph` compute `(acc*mul + bias+div/2 + noise) >> d`
+= ROUND — no device-kernel edit, no host-ref edit, bit-exactness preserved by construction.
+
+Verified equivalent to the `QZO_FORCE_REQUANT_ROUND` diagnostic: g_proj sequence byte-identical
+`[17.0606, 27.5042, -17.2079, 22.1271, ...]`. Commit `3b710e6`.
+
+**Answer to the whole investigation:** the QZO accuracy drop (83% < zero-shot, vs Brevitas 88.89%)
+was NOT a nature of quantized ZO — it was a requant TRUNCATION bug (our variable-add bias defeated
+the merge pass's rounding). Fixed. Host int datapath now trains UP (85.00 -> 87.22 @50ep, ~88% @200ep).
+
+### Remaining (device confirmation, in progress)
+- baked_200ep run -> device-correct fixture + host reference + updated weights (~88% expected).
+- Then: pack -> single-step device bit-exactness (must round, stay bit-exact) -> full round-1
+  device run -> device accuracy ~88%. This closes "faithful on-device sim + good accuracy".

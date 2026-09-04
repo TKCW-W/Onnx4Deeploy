@@ -104,3 +104,23 @@ the entire accuracy bug.** The whole investigation resolves to a one-line requan
 - Hypothesis to test: B's RequantShift **truncates** (`>>S`) while Brevitas A **rounds** — a
   half-LSB bias per layer, invisible unperturbed (calibrated to match) but amplified when
   perturbation pushes activations across rounding boundaries.
+
+### Device-fix analysis (iteration 4) — exact locations
+
+Traced the device requant end-to-end:
+- `Deeploy/Targets/PULPOpen/TopologyOptimizationPasses/Passes.py:173-180` (OUR merge pass):
+  computes `rounding = 2^(totalShift-1)` and bakes it into the add ONLY for a CONSTANT add;
+  for a VARIABLE add (our perturbable conv bias) it skips — comment says "matching the host
+  reference truncation." That deliberate choice made host+device consistently WRONG.
+- int8 requant = `pulp_nn_bn_quant_i8` (`third_party/pulp-nn-mixed/.../pulp_nn_utils.h:271`):
+  `integer_image_phi = k*phi + lambda; x = integer_image_phi >> d;`  — TRUNCATE, no +2^(d-1).
+- Standalone `RequantShift.c` kernel DOES round (has a `rounding` flag, template passes 1); only
+  the merged-conv path truncates — why non-conv RQS was fine and only conv output was hurt.
+
+RECOMMENDED FIX (no third-party kernel edit, preserves bit-exactness): bake `2^(totalShift-1)`
+into the conv `bias_rqsadd` initializer at export (`build_int8_forward`). Then the variable add
+carries the rounding; host (`run_onnx_graph`, no env flag) and device (`pulp_nn_bn_quant_i8`)
+both compute `(acc*mul + bias+rounding + noise) >> d` → round, consistently → bit-exact AND
+correct. `QZO_FORCE_REQUANT_ROUND` was the DIAGNOSTIC; the shipped fix is the baked constant.
+
+Verify after: single-step device bit-exactness (rounded), then full round-1 device run + accuracy.

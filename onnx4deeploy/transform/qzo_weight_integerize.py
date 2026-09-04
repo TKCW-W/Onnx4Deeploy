@@ -362,6 +362,17 @@ def build_int8_forward(
                 # QW: same per-layer ratio for the add — exact form add = b_int·mul_exact,
                 #     i.e. round(s_w·b_int·(s_in/s_out)·div) = round(b_fp32/s_out·div). -- QW
                 add = np.round(s_w * b * (_si / _so) * div).astype(np.int32)  # int32 bias in RQS-add units
+                # QW exp10 ROUNDING FIX: the conv requant is (acc*mul + add) >> log2(div). The
+                #   merge pass bakes the +div/2 rounding constant only for a CONSTANT add; our
+                #   `add` is the VARIABLE (perturbable) bias, so both the device kernel
+                #   (pulp_nn_bn_quant_i8) and the host run_onnx_graph would TRUNCATE (floor).
+                #   Floor's -0.5-LSB bias is invisible to inference (cos 0.9994) but is NOT
+                #   antithetic-symmetric, so it does not cancel in the ZO signal L+-L- and
+                #   corrupts/sign-flips the gradient (exp10: g -1.81 -> +17.06 with rounding,
+                #   accuracy 83.89 -> 87.22). Bake the rounding into the bias initializer so BOTH
+                #   host and device round consistently (bit-exactness preserved) and correctly.
+                #   The +div/2 is a fixed offset; ZO ±LSB updates leave it effectively intact. -- QW
+                add = (add.astype(np.int64) + (int(div) // 2)).astype(np.int32)
                 add_name = f"{ent['bias_src']}_rqsadd"
                 del n.input[2]                                         # Conv now 2-input (weight only)
                 ent["bias_rqs_name"] = add_name                       # perturbable int32 bias lives here

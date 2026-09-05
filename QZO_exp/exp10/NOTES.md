@@ -214,3 +214,13 @@ Brevitas at the operating point, and dropped zero-shot 85.00 -> 83.33. Two forwa
       truth for the absolute forward (it is fake-quant, an approximation of true int8).
 Next iteration: settle (c) with an independent int8 reference; confirm the rounding constant;
 then decide whether 86.67 (true int8) or 88.89 (Brevitas) is the honest deployable number.
+
+### Iteration 8b — recalibration (calmer read)
+
+cos 0.986 is HIGH (the mul bug was 0.87); zero-shot moved 85.00->83.33 = ~3 windows = small.
+The rounding fix is fundamentally sound: it fixes the GRADIENT + training (dominant), and the
+small forward shift is likely because Brevitas fake-quant rounds at its ACTIVATION quantizer
+while true int8 rounds at the REQUANT — different points, so Brevitas is an approximation of the
+true device forward. Honest deployable number is likely the true-int8 86.67%, not Brevitas 88.89.
+DECISIVE next step: independent int8 numpy conv+requant reference (explicit rounding) to
+adjudicate round vs truncate WITHOUT assuming Brevitas is ground truth. Then finalize the number.

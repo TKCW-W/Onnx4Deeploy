@@ -178,3 +178,13 @@ baking in the graph is the host+device-consistent fix.)
 **Root cause is now confirmed three independent ways:** (a) g_proj sign-flip -1.81->+17.06 with
 rounding; (b) host accuracy 83.89->87.22 with rounding; (c) the shipped reference bakes exactly
 this rounding and we had removed it. The supervisor's "direct int8 works" is fully explained.
+
+### Iteration 7 — DEVICE bit-exactness of the fix: PASSED
+
+2-step baked fixture (div/2 baked into bias, no env flag) on GVSoC: **Errors: 0 out of 16,
+PASSED.** The device kernel `pulp_nn_bn_quant_i8` now rounds (via the baked bias) and is
+bit-exact against the rounded host reference. Fix validated host + device.
+
+Status: root cause found + 3-way confirmed + shipped-ref confirmed; fix shipped (3b710e6);
+host accuracy recovered (85.00->87.22 @50ep); device bit-exact with fix (0/16). Remaining: full
+round-1 device accuracy (baked_200ep fixture -> device run -> ~88%).

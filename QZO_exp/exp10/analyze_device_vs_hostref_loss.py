@@ -52,3 +52,26 @@ for a, b in [(0, 5), (5, 100), (100, 500), (500, 1500), (1500, len(rs))]:
 print("\nstep 0, per-accum rel-resid:", rel[:4])
 print("=> ~1e-7 at step 0 (identical weights) = fp32 last-ulp; the mechanism is identical.")
 print("=> growth to ~1e-1 = round()-threshold amplification (deterministic chaos).")
+
+# --- category split: separates ubiquitous forward ulp noise from rare weight bifurcation ---
+# (added 2026-09-05 for the three-way DIVERGENCE_NOTES section, puzzle 2)
+bit = dev.astype(np.float32).view(np.uint32) == lp.astype(np.float32).view(np.uint32)
+idx = np.arange(n)
+
+
+def cats(sel):
+    r, b = rel[sel], bit[sel]
+    N = max(len(r), 1)
+    return (100 * b.sum() / N,
+            100 * ((~b) & (r < 1e-5)).sum() / N,   # ulp-only: forward fp32 noise
+            100 * (r >= 1e-3).sum() / N)            # LARGE: weight bifurcation
+
+
+e, u, l = cats(slice(None))
+print(f"\nOVERALL category: bit-exact={e:.1f}%  ulp-only(<1e-5)={u:.1f}%  LARGE(>=1e-3)={l:.1f}%")
+print("per-step-band: %bit-exact | %ulp-only | %LARGE  (ulp=forward noise, LARGE=bifurcation)")
+for a, b in [(0, 1), (0, 10), (10, 100), (100, 500), (500, 1500), (1500, n // 4)]:
+    e, u, l = cats((idx // 4 >= a) & (idx // 4 < b))
+    print(f"  steps {a:4d}-{b:4d}: exact={e:5.1f}%  ulp={u:5.1f}%  LARGE={l:5.1f}%")
+print("=> step 0: 100% ulp / 0% LARGE (weights identical) -> 'most differ' = forward noise,")
+print("   NOT threshold-crossing. LARGE is 2.5% <100 steps, accumulates to ~99% by step 500+.")

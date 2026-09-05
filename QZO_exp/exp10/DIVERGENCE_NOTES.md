@@ -124,6 +124,102 @@ would be a band-aid, not a faithful reference. The faithful reference is the gra
 share; the device reproduces it to the fp32 floor at step 0 and converges to the same
 accuracy. Nothing to fix here.
 
+## Three-way disagreement: Brevitas (A) vs true-int8 host (B-host) vs device (B-device)
+
+_Added 2026-09-05 16:24 CEST. Two puzzles: (1) Brevitas A (88.89%) is "direct int8 too" —
+why does it diverge MORE from B than B-device and B-host diverge from each other? (2) The
+device update is direct int8 (not accumulated) and the per-step forward diff is only ~1e-7;
+for that to bifurcate a weight it must land near a rounding threshold, which should be rare —
+yet the great majority of losses differ. How?_
+
+### Puzzle 2: "most losses differ" is two different phenomena, not one
+
+Decoding the 10800 device +eps loss bit-words vs host-ref `loss_plus` and **categorizing**
+each residual (not just "equal / not equal") splits it cleanly:
+
+| category | count / 10800 | what it is |
+|---|---|---|
+| bit-exact | 165 (1.5%) | fp32 tail happened to land on the same bits |
+| **ulp-only** (rel < 1e-5) | 1159 (10.7%) | **forward fp32 noise — weights identical, expf/logf/FMA differ** |
+| medium (1e-5–1e-3) | 570 (5.3%) | transition |
+| **LARGE** (rel ≥ 1e-3) | 8906 (82.5%) | **weight bifurcation — trajectories in different weight space** |
+
+Per-step band (fraction bit-exact / ulp-only / LARGE):
+
+| steps | bit-exact | ulp-only | LARGE |
+|---|---|---|---|
+| **0–1** (weights provably identical) | 0% | **100%** | **0%** |
+| 0–10 | 17% | 75% | 2.5% |
+| 10–100 | 12% | 83% | 0% |
+| 100–500 | 7% | 52% | 16% |
+| 500–1500 | 0% | 0.1% | **97%** |
+| 1500–2700 | 0% | 0% | **99%** |
+
+**Resolution.** "Non-bit-exact" and "threshold-crossing" are different events, and the
+puzzle conflated them:
+
+1. **Why do most losses differ at all?** Because two distinct fp32 forwards never bit-match.
+   At step 0 the int8 weights are *provably identical* (single-step 0/16) yet **100% of the
+   losses already differ** — all at ~1e-7 (ulp), none large. This ubiquitous ulp noise
+   (expf/logf/FMA under `-ffast-math`) is what makes the overwhelming majority non-bit-exact.
+   It has nothing to do with rounding thresholds or weight changes.
+2. **Does the ~1e-7 land near a threshold "so often"?** No. LARGE (percent) differences —
+   the actual weight bifurcations — are only **2.5% of losses in the first 100 steps**. The
+   threshold crossing IS rare per step, exactly as intuition says. It only *looks* frequent
+   later because **crossings are permanent and accumulate**: once one int8 weight flips it
+   stays flipped, so the fraction of drifted weights climbs monotonically until (step 500+)
+   the whole weight vector has separated and ~all losses read LARGE-different. The direct
+   (non-accumulated) update does not accumulate the ulp *in one step*, but it does accumulate
+   the *bifurcations across steps*. Ubiquity = forward ulp noise; growth = cumulative rare
+   crossings. Two separate mechanisms.
+
+### Puzzle 1: Brevitas A is a different computation, not "direct int8"
+
+The premise "Brevitas was direct int8 as well" is the misconception. **Brevitas is
+fake-quant**: fp32 values *snapped* to the quant grid (`round(x/s)·s`), the conv accumulated
+in **fp32**, the rescale done by the **exact float scale** with a single float round at the
+activation quantizer. **B is the true integer datapath**: `int8×int8→int32` exact
+accumulation, rescale by a **dyadic fixed-point `mul >> shift`**, integer round-half-up. A
+*simulates* int8 in float; B *is* int8.
+
+**Decisive, training-free measurement — zero-shot, identical weights, no ZO at all:**
+
+| actor | zero-shot b2 | trained (round-1) |
+|---|---|---|
+| **A** Brevitas fake-quant (fc-float) | **85.00%** | 88.89% |
+| **B-host** true int8 `run_onnx_graph` | **83.33%** | 86.67% |
+| **B-device** true int8 GVSoC | **83.33%** (= B-host) | 85.56% |
+
+The **1.67-point A-vs-B gap exists with zero training** — so it is purely a *forward
+algorithm* difference, not a trajectory difference. And **B-host = B-device at zero-shot**
+(the integer forward is bit-exact across platforms; the fp32 tail is identical on a single
+forward, proven by 0/16). So the three-way ordering is set before a single ZO step.
+
+**Exactly where the A↔B drift lives.** Only the **5 conv requant layers** are quantized (fc
+is float on both A and B), so the gap is entirely in those requants. The deployed graph
+realizes each output channel's scale as `mul / 2^16` with **`mul` a small integer 60–456**
+(measured from `network_zo_train.onnx`) — a per-channel scale granularity of `~1/mul ≈
+0.2–1.6%`. It *cannot* represent Brevitas's exact float scale. That systematic per-channel
+scale mismatch, plus integer round-half-up vs Brevitas's float round, shifts B's logits from
+A's by ~1.4% in the **same direction** across the batch — hence **logit cos 0.986** (not
+0.9999) and A sitting ~1.7 pt above B at zero-shot, ~2–3 pt above after training. It is a
+*systematic* offset (Brevitas is a slightly optimistic proxy), not ulp noise.
+
+### Why A diverges more — the hierarchy
+
+| pair | what differs | magnitude | visible at zero-shot? |
+|---|---|---|---|
+| **A ↔ B** | the **computation** (float fake-quant vs integer fixed-point requant) | systematic ~1.4% logits / ~2 pt acc | **yes** (85.00 vs 83.33) |
+| **B-host ↔ B-device** | the **platform** (numpy vs `-ffast-math`), *same* computation | ulp ~1e-7 forward; integer part **bit-exact** | no (both 83.33) |
+
+A diverges more because **it is not the same computation as the device** — it is a float
+approximation of quantization that rounds ~2 pt optimistically, and that gap is baked into
+the forward, present before any training. B-host and B-device *are* the same computation, so
+they agree bit-exactly on the integer forward and differ only in the fp32 tail — which merely
+reshuffles the ZO random walk to nearly the same endpoint (86.67 vs 85.56), never a
+systematic offset. Put simply: **A↔B is a model difference; B↔B is a rounding-of-the-last-bit
+difference.**
+
 ## Files
 
 - `analyze_device_vs_hostref_loss.py` — decodes the 10800 device loss bit-words and

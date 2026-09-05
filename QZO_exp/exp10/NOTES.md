@@ -188,3 +188,29 @@ bit-exact against the rounded host reference. Fix validated host + device.
 Status: root cause found + 3-way confirmed + shipped-ref confirmed; fix shipped (3b710e6);
 host accuracy recovered (85.00->87.22 @50ep); device bit-exact with fix (0/16). Remaining: full
 round-1 device accuracy (baked_200ep fixture -> device run -> ~88%).
+
+### Iteration 8 — 200ep baked result: training FIXED, but a forward-fidelity tension to resolve
+
+Baked (rounded, true integer datapath), host, batch 2:
+| datapath | zero-shot | trained 200ep | Δ |
+|---|---|---|---|
+| round-integer (device-faithful) | 83.33 | **86.67** | **+3.34 (UP)** |
+| Brevitas A | 85.00 | 88.89 | +3.89 |
+| truncate-integer (bug) | 85.00 | 83.89 | -1.11 (DOWN) |
+
+**Core problem SOLVED:** the integer datapath now trains UP (+3.34), like Brevitas (+3.89),
+instead of down. QZO improves accuracy on the true int8 path (~87%, near float-ZO ~88%).
+
+**OPEN tension (do not gloss):** the baked ROUNDED forward vs Brevitas is cos **0.9860** (29/30
+argmax) — WORSE than the TRUNCATING forward's cos **0.9994** measured in exp9. So rounding
+aligned the GRADIENT with Brevitas (fixes training) but moved the ABSOLUTE forward AWAY from
+Brevitas at the operating point, and dropped zero-shot 85.00 -> 83.33. Two forwards that both
+"round" should match better, not worse. Possible causes to check next:
+  (a) my +div/2 rounding is mis-scaled / double-applied somewhere;
+  (b) Brevitas Int8ActPerTensorFloat uses a different rounding (half-even vs half-up) or rounds
+      at the activation-quant, not the requant, so truncate-integer coincidentally matched it;
+  (c) which of round/truncate is the TRUE int8 forward? Need a reference-independent int8
+      numpy reimplementation of conv+requant to adjudicate — do NOT assume Brevitas is ground
+      truth for the absolute forward (it is fake-quant, an approximation of true int8).
+Next iteration: settle (c) with an independent int8 reference; confirm the rounding constant;
+then decide whether 86.67 (true int8) or 88.89 (Brevitas) is the honest deployable number.

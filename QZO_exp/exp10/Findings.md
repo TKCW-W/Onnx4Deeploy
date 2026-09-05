@@ -89,8 +89,11 @@ True int8 datapath (device-faithful, rounded), host, batch 2:
 ## Answer
 
 The QZO accuracy drop was a **requant-rounding bug** (a deviation from the shipped reference), not
-a property of quantized ZO. Fixed at export; host + device validated. The Brevitas 88.89% is
-reachable on the true integer datapath.
+a property of quantized ZO. Fixed at export; host + device validated. The true int8 datapath now
+trains UP to **86.67%** (from 83.33 zero-shot), close to float ZO (~87–88%) — goal met. The
+remaining ~2 pts vs Brevitas' 88.89% is the fake-quant-vs-true-int8 rounding-point residual
+(Brevitas is a slightly optimistic approximation), not a bug; the honest deployable number is the
+true-int8 86.67%.
 
 ## Files
 

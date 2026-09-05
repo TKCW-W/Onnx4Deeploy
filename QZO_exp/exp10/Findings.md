@@ -76,6 +76,16 @@ doesn't run the merge pass — the graph constant is the one place host and devi
 - In progress: baked 200ep host accuracy (expect ~88%, i.e. == Brevitas — which also validates
   that the Brevitas reference is faithful to the fixed integer datapath).
 
+## Final numbers (iteration 8-9)
+
+True int8 datapath (device-faithful, rounded), host, batch 2:
+- zero-shot 83.33 -> **trained 86.67% (+3.34)** — trains UP; the bug (trained DOWN to 83.89) is gone.
+- Brevitas A: 85.00 -> 88.89. Brevitas is a fake-quant approximation that rounds in FLOAT at its
+  activation quantizer, ~2 pts optimistic vs the fixed-point requant round-half-up the device does
+  (cos 0.986, not a bug — verified the baking adds div/2 exactly once: block0 add=32768=div/2).
+- 86.67% ~ float-ZO (~87-88%): the goal (QZO improves accuracy, similar to float ZO) is MET.
+- Honest deployable number = 86.67% (true int8, bit-exact on device), not Brevitas 88.89%.
+
 ## Answer
 
 The QZO accuracy drop was a **requant-rounding bug** (a deviation from the shipped reference), not

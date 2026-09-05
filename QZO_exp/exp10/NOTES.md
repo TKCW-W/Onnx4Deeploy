@@ -143,3 +143,38 @@ the merge pass's rounding). Fixed. Host int datapath now trains UP (85.00 -> 87.
 - baked_200ep run -> device-correct fixture + host reference + updated weights (~88% expected).
 - Then: pack -> single-step device bit-exactness (must round, stay bit-exact) -> full round-1
   device run -> device accuracy ~88%. This closes "faithful on-device sim + good accuracy".
+
+---
+
+## Iteration 6 (2026-09-05) — SHIPPED REFERENCE CONFIRMS: we deviated from its rounding
+
+Traced the shipped `Onnx4Deeploy_ZO` + shipped `Deeploy` QZO path entry->output (as instructed):
+
+1. Shipped `zo_transform.py:43,250-252` perturbs the `_add` (int32 pre-shift bias) — SAME
+   variable-add-bias structure as ours. So structure is not the difference.
+2. Shipped `Deeploy/.../TopologyOptimizationPasses/Passes.py:177-182`:
+   ```python
+   rounding = 2**(totalShift - 1) if totalShift > 0 else 0
+   # Bake rounding into lambda so the fused bn_quant kernel rounds correctly
+   rqs.inputs[-1].values = copy.deepcopy(rqs.inputs[-1].values) + rounding
+   ```
+   The shipped merge pass **UNCONDITIONALLY bakes div/2 into the bias add** (also line 120), while
+   the bias is still constant — THEN zo_transform perturbs it. So the shipped `_add` carries the
+   rounding constant, the fused `pulp_nn_bn_quant_i8` `(k*phi+lambda)>>d` rounds correctly, and
+   QZO trains well (== the supervisor's direct-int8 result).
+
+3. **Our bug was a deviation FROM shipped:** our vendored `Passes.py` was modified to bake
+   rounding "only for a constant add; for a variable add the kernel truncates — matching the host
+   reference" (`-- QW`), and our custom `build_int8_forward` created the variable `bias_rqsadd`
+   WITHOUT the rounding constant. Both changes dropped the shipped rounding for the (now variable)
+   bias -> truncation -> corrupted ZO gradient -> 83% accuracy.
+
+**Our fix (`3b710e6`) restores shipped behavior** by baking div/2 into `bias_rqsadd` at export,
+visible to BOTH the host interpreter (`run_onnx_graph`) and the device kernel -> both round,
+bit-exactness preserved. (Reverting only the vendored merge pass would NOT suffice: the host
+`run_onnx_graph` doesn't run the merge pass, so it would still truncate and break bit-exactness;
+baking in the graph is the host+device-consistent fix.)
+
+**Root cause is now confirmed three independent ways:** (a) g_proj sign-flip -1.81->+17.06 with
+rounding; (b) host accuracy 83.89->87.22 with rounding; (c) the shipped reference bakes exactly
+this rounding and we had removed it. The supervisor's "direct int8 works" is fully explained.

@@ -84,3 +84,12 @@ recomputed from `lp_bits`/`lm_bits` with the harness rule (|dev − ref| > 0.001
 (`3f9d48ea 3e2d5aa0 3dffdca0 3fc556fd`) → chain and lr-independence validated on device. The harness line
 `FAILED - 6 errors out of 16` is EXPECTED here: the smoke was compared against the placeholder 1e-5 reference
 (8 step-0 losses match, the step-1 losses differ because the step-0 update used a different lr). Not a defect.
+
+**Overlap decision (17:40):** the device round-1 was launched BEFORE the 3e-6 export finished, using the already-packed
+lr-independent fixture (its compiled-in reference is the 1e-5 placeholder). Rationale: the device run does not need the
+3e-6 reference to execute, and the harness rule recomputed from the logged raw `lp_bits`/`lm_bits` reproduces the
+harness count exactly (validated: 8302 + 8263 = 16565 on the 1e-5 log). Therefore the reported exp12 `Errors:` count is
+`analyze_exp12.py`'s recount of the device bits against `baked_3e6/outputs.npz`; the harness's own printed line in
+`device_round1_3e6.log` is against the placeholder and must be ignored. Saves ~5 h wall.
+Launch (host): `pgrep -f "[g]vsoc_launcher" | xargs kill -9`, then the same runner command as the smoke with
+`--n-steps 2700` → `device_round1_3e6.log` (no re-pack).

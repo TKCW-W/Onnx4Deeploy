@@ -38,3 +38,10 @@ both sides) would make `g`, `coeff`, the fp32 parameters and therefore the whole
 not merely within tolerance. Conversely, no change confined to the int update path (freezing, master weights) can reach
 float-ZO tolerance while the seed remains: exp13 is "fp32-only training on device" and still diverges to 27%.
 Decision pending with the user.
+
+## Micro-trace (2026-09-07) — see `micro/FINDINGS.md`
+Layer-by-layer device-vs-host bit-level probes of the step-0 +eps forward: **every integer stage bit-exact** (all five
+conv+requant outputs 0 differing elements); **the first difference appears at BN-0** (25% of elements, mostly 1 ulp,
+max 4) and is re-created by every BatchNormInternal (25–46%), absorbed by the following Quant, and reaches the loss only
+through BN-4 → GAP → fc (logits 7/9 at 1–2 ulp → loss 5 ulp). The int path does not participate. Causal one-kernel
+confirmation (strict-fp BatchNorm.c, re-run probe 1 → expect 0) proposed, awaiting go/no-go.

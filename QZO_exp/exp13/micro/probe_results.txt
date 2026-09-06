@@ -1,0 +1,16 @@
+01:32 probe_0 QCDQ_/blocks_0_conv_output_dequant/Mul_Dequant | Errors: 0 out of 78512 | max|diff|=0.000e+00
+01:33 probe_1 /bn/BatchNormalization | Errors: 19841 out of 78512 | max|diff|=2.000e-06
+01:34 probe_2 /pool/MaxPool | Errors: 2543 out of 9744 | max|diff|=2.000e-06
+01:34 probe_3 QCDQ_/blocks_1_conv_output_dequant/Mul_Dequant | Errors: 0 out of 19712 | max|diff|=0.000e+00
+01:35 probe_4 /bn_1/BatchNormalization | Errors: 7916 out of 19712 | max|diff|=1.000e-06
+01:36 probe_5 /pool_1/MaxPool | Errors: 1163 out of 4928 | max|diff|=1.000e-06
+01:36 probe_6 QCDQ_/blocks_2_conv_output_dequant/Mul_Dequant | Errors: 0 out of 5152 | max|diff|=0.000e+00
+01:36 probe_7 /bn_2/BatchNormalization | Errors: 2139 out of 5152 | max|diff|=0.000e+00
+01:37 probe_8 /pool_2/MaxPool | Errors: 348 out of 1120 | max|diff|=0.000e+00
+01:37 probe_9 QCDQ_/blocks_3_conv_output_dequant/Mul_Dequant | Errors: 0 out of 1280 | max|diff|=0.000e+00
+01:38 probe_10 /bn_3/BatchNormalization | Errors: 563 out of 1280 | max|diff|=0.000e+00
+01:38 probe_11 QCDQ_/blocks_4_conv_output_dequant/Mul_Dequant | Errors: 0 out of 320 | max|diff|=0.000e+00
+01:39 probe_12 /bn_4/BatchNormalization | Errors: 146 out of 320 | max|diff|=0.000e+00
+01:39 probe_13 /global_pool/GlobalAveragePool | Errors: 8 out of 32 | max|diff|=0.000e+00
+01:39 probe_14 /wrappedInnerForwardImpl_5/Gemm | Errors: 7 out of 9 | max|diff|=0.000e+00
+SWEEP_DONE

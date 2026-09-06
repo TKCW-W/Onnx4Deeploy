@@ -79,3 +79,8 @@ with `--n-steps 2700`, log → `device_round1_3e6.log`).
 **4. Analysis:** `python3 analyze_exp12.py` — prints the harness `Errors: N out of 21600` line, the same count
 recomputed from `lp_bits`/`lm_bits` with the harness rule (|dev − ref| > 0.001 abs; validated on the 1e-5 log:
 8302 + 8263 = 16565 exactly), per-band categories for L+ and L−, and the first LARGE step — for both runs side by side.
+
+**Smoke result (2026-09-06 17:27):** `[BN_FROZEN_STATS]` on, 22 `[WDUMP]` lines, step-0 `lp_bits` == 1e-5 run
+(`3f9d48ea 3e2d5aa0 3dffdca0 3fc556fd`) → chain and lr-independence validated on device. The harness line
+`FAILED - 6 errors out of 16` is EXPECTED here: the smoke was compared against the placeholder 1e-5 reference
+(8 step-0 losses match, the step-1 losses differ because the step-0 update used a different lr). Not a defect.

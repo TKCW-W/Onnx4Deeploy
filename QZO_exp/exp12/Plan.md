@@ -32,3 +32,50 @@ and are transient; (c) aligning every host op we own changed nothing.
 2. `smoke_3e6_2step.log` — pack→build→run chain validated on 2 steps first; step-0 `lp_bits` must equal the 1e-5 run's (forward is lr-independent).
 3. `device_round1_3e6.log[.gz]` — full 2700-step GVSoC run (`deeployMezoRunner_tiled_siracusa.py ... --lr 3e-6 -D BN_FROZEN_STATS=ON DUMP_WEIGHTS=ON`).
 4. `analysis/` — `Errors:` line from the log; per-band LARGE table vs the 1e-5 run; final-weight diff (int8 must be identical; float drift isolated).
+
+## Reproduction — exact commands as executed (for checking my execution)
+
+Containers: `agitated_hugle` = Onnx4Deeploy/ORT/Brevitas (repo at `/app/Onnx4Deeploy`, TrainDeeploy at
+`/app/TrainDeeploy`, SilentWear at `/app/SilentWear`); `traindeeploy` = device toolchain + GVSoC (ETH tree at
+`/app/ETH/...`). Orphan GVSoC is killed by PID on the host before every device run.
+
+**1. Host reference export at lr 3e-6** (identical to the 1e-5 export except `--lr`; ~4.5 h):
+```bash
+docker exec -d agitated_hugle bash -c "cd /app/Onnx4Deeploy && \
+  QZO_POOLED_THRESHOLDS=/app/TrainDeeploy/DeeployTest/experiments/deliverable/exp9_QZO_round1/fixture/pooled_9999_fold3.json \
+  python3 Onnx4Deeploy.py -model SpeechNet -mode q-zo-train --noise-type rqs_rademacher \
+    --dataset silentwear --data-path /app/SilentWear/SilentWear_data/data_raw_and_filt \
+    --pretrained-weights /app/SilentWear/SilentWear/artifacts/models/inter_session_ft/S01/vocalized/speechnet/w1400ms/model_1/leave_one_session_out_fold_3.pt \
+    --subject S01 --session 3 --condition vocalized --batch 1 --data-size 54 --stratified \
+    --n-epochs 200 --n-accum 4 --lr 3e-6 --bn-frozen-stats \
+    -o /app/Onnx4Deeploy/QZO_exp/exp12/baked_3e6 > /app/Onnx4Deeploy/QZO_exp/exp12/export_3e6.log 2>&1"
+```
+Check: `grep "multi-step sim" export_3e6.log` must show `data_size=54 n_accum=4 → n_steps=2700 lr=3e-06 eps=0.01 seed=42`;
+`baked_3e6/network_zo_train.onnx`, `network_zo_update.onnx` and the params in `inputs.npz` must be identical to
+`exp10/baked_200ep/` (lr is not baked into the fixture; the update graph carries `eps=0.01`).
+
+**2. Smoke (chain validation, 2 steps, fixture packed from the lr-independent 1e-5 export):**
+```bash
+pgrep -f "[g]vsoc_launcher" | xargs kill -9
+docker exec traindeeploy bash -c 'cd /app/ETH/TrainDeeploy/DeeployTest && rm -rf TEST_SIRACUSA && \
+  python3 experiments/zo_smoke/pack_2step_fixture.py /app/ETH/Onnx4Deeploy/QZO_exp/exp10/baked_200ep \
+    /app/ETH/TrainDeeploy/DeeployTest/Tests/Models/Training/SpeechNet speechnet_qzo_lr3e6_train speechnet_qzo_lr3e6_update'
+docker exec -d traindeeploy bash -c 'cd /app/ETH/TrainDeeploy/DeeployTest && \
+  python3 deeployMezoRunner_tiled_siracusa.py -t Tests/Models/Training/SpeechNet/speechnet_qzo_lr3e6_train \
+    --optimizer-dir Tests/Models/Training/SpeechNet/speechnet_qzo_lr3e6_update \
+    --n-steps 2 --n-accum 4 --num-data-inputs 2 --eps 0.01 --lr 3e-6 --q 1 --seed 42 \
+    --l1 128000 --l2 2000000 --cores 8 -D BN_FROZEN_STATS=ON DUMP_WEIGHTS=ON \
+    > /app/ETH/Onnx4Deeploy/QZO_exp/exp12/smoke_3e6_2step.log 2>&1'
+```
+Check: `[BN_FROZEN_STATS]` line present; `[WDUMP ...]` lines present; step-0 `lp_bits` == the 1e-5 run's step-0
+bits `3f9d48ea 3e2d5aa0 3dffdca0 3fc556fd` (the forward is lr-independent).
+Note: `--dump-weights` is NOT a runner flag (first attempt failed on argparse); the dump is the CMake passthrough
+`-D DUMP_WEIGHTS=ON`, same path as `BN_FROZEN_STATS`.
+
+**3. Full device round-1 at 3e-6** (after step 1 finishes; re-packs from `baked_3e6` so its `outputs.npz` is the
+compiled-in reference the harness compares against; ~5 h): `./run_device_3e6.sh` (this dir; same runner command
+with `--n-steps 2700`, log → `device_round1_3e6.log`).
+
+**4. Analysis:** `python3 analyze_exp12.py` — prints the harness `Errors: N out of 21600` line, the same count
+recomputed from `lp_bits`/`lm_bits` with the harness rule (|dev − ref| > 0.001 abs; validated on the 1e-5 log:
+8302 + 8263 = 16565 exactly), per-band categories for L+ and L−, and the first LARGE step — for both runs side by side.

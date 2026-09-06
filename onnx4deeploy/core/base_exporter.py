@@ -764,6 +764,11 @@ class BaseONNXExporter(ABC):
         print("🔧 build_qzo_train_graph + build_qzo_update_graph...")
         _, param_inputs = build_qzo_train_graph(net, self.paths["network_zo_train"], eps=eps, seed=seed)
         build_qzo_update_graph(net, self.paths["network_zo_update"], eps=eps, seed=seed)
+        if _os.environ.get("QZO_FREEZE_CONV"):  # -- QW exp13: train ONLY the fp32 params (conv weight+bias frozen)
+            from onnx4deeploy.transform.qzo_transform import freeze_conv_pmul as _fcp
+            for _gp in (self.paths["network_zo_train"], self.paths["network_zo_update"]):
+                _gm = onnx.load(_gp); _k = _fcp(_gm); onnx.save(_gm, _gp)
+                print(f"   [QZO_FREEZE_CONV] zeroed {_k} *_pmul initializers in {_os.path.basename(_gp)}")
 
         # 5. fixture I/O + host reference ---------------------------------------------------------------
         # QW: inputs.npz uses POSITIONAL arr_NNNN keys in GRAPH-INPUT ORDER — the float-ZO convention
@@ -849,6 +854,9 @@ class BaseONNXExporter(ABC):
         build_qzo_train_graph(net, _QM, eps=-eps, seed=int(seed))
         _mp_proto = onnx.load(_QP)
         _mm_proto = onnx.load(_QM)
+        if _os.environ.get("QZO_FREEZE_CONV"):  # -- QW exp13: same freeze in the +-eps sim graphs
+            from onnx4deeploy.transform.qzo_transform import freeze_conv_pmul as _fcp
+            _fcp(_mp_proto); _fcp(_mm_proto)
         _PERT_OPS = ("RQSPerturbRademacher", "PerturbRademacher")
 
         def _patch_seed(_model, _sd):
@@ -887,6 +895,8 @@ class BaseONNXExporter(ABC):
             for p in pmeta:
                 nm = p["name"]
                 if p["kind"] == "rqs":
+                    if _os.environ.get("QZO_FREEZE_CONV"):  # -- QW exp13: conv weight+bias frozen -> no update
+                        continue
                     mul = _np.round(eps / p["scale"] * p["div"]).astype(_np.int32)   # == the baked *_pmul
                     upd = _perturb_rqs_rademacher(P[nm], mul, seed_eff, p["idx"], p["div"], p["nlev"],
                                                   1, sign=1, eps_ratio=ratio)

@@ -364,3 +364,19 @@ def build_qzo_int8_graph(model, scales, out_path, eps=0.01, seed=42, label_name=
     print(f"  [qzo] int8 datapath (weights-as-inputs, BatchNormInternal, Add/Sub) -> {out_path}  "
           f"({pcount[0]} perturb nodes, {len(param_inputs)} trainable inputs)")
     return out_path, param_inputs
+
+def freeze_conv_pmul(model):  # -- QW exp13
+    """Freeze the int8 conv weights AND int32 biases for ZO training by zeroing every `*_pmul` initializer
+    consumed by an RQSPerturbRademacher node (train and update graphs). With mul == 0 the RQS perturbation is
+    exactly (rad*0 + 2^(S-1)) >> S == 0 for the +-eps forward and for the update, on the device (compiled-in
+    constant) and on the host (initializer) alike. Graph structure, node ids and the float-param noise are
+    untouched, so a frozen run differs from the unfrozen one ONLY by the freeze. Returns #initializers zeroed."""
+    import numpy as _np
+    from onnx import numpy_helper as _nh
+    muls = {n.input[1] for n in model.graph.node if n.op_type == "RQSPerturbRademacher" and len(n.input) > 1}
+    k = 0
+    for init in model.graph.initializer:
+        if init.name in muls:
+            arr = _nh.to_array(init); z = _np.zeros_like(arr)
+            init.CopyFrom(_nh.from_array(z, init.name)); k += 1
+    return k

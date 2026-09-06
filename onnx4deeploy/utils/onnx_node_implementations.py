@@ -479,6 +479,33 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
                 result = result + C.astype(np.int32)
             return [result]
         else:
+            # [exp11-orig] return [(alpha * np.matmul(A, B) + beta * C).astype(A.dtype)]
+            # exp11 L2 step 2 (2026-09-06): mirror PULP_Gemm_fp32_fp32_fp32_fp32, `!transA && transB` branch
+            # (our fc: M=1,N=32,O=9), bit-for-bit. Per output j the C kernel does, for k < N_unroll=N-N%6 in
+            # steps of 6:  sum += ((((p0+p1)+p2)+p3)+p4)+p5  (a 6-term LEFT-ASSOC temporary, p_u = a[k+u]*b_j[k+u]),
+            # then singles for the remaining k, then y = sum + c[j]. The unrolled block (j<O_unroll) and the tail
+            # loop (j>=O_unroll) use this identical sequence, so one routine covers every output. Here A,B are
+            # already transposed to matmul layout, so b_j[k] for all j is B[k, :]. np.matmul (BLAS) accumulates in a
+            # different order -> different fp32 rounding. Other trans combos keep the original matmul. -- QW
+            _tA = int(attrs.get("transA", 0)); _tB = int(attrs.get("transB", 0))
+            if _tA == 0 and _tB == 1 and alpha == 1.0 and beta == 1.0 and A.ndim == 2:
+                _A = A.astype(np.float32); _B = B.astype(np.float32)          # _A [M,N], _B [N,O]
+                _M, _N = _A.shape; _O = _B.shape[1]; _Nu = _N - (_N % 6)
+                _Y = np.zeros((_M, _O), np.float32)
+                _Cf = None if isinstance(C, float) else np.asarray(C, np.float32)
+                for _i in range(_M):
+                    _a = _A[_i]; _sum = np.zeros(_O, np.float32)
+                    for _k in range(0, _Nu, 6):
+                        _t = _a[_k] * _B[_k, :]
+                        for _u in range(1, 6):
+                            _t = _t + _a[_k + _u] * _B[_k + _u, :]
+                        _sum = _sum + _t
+                    for _k in range(_Nu, _N):
+                        _sum = _sum + _a[_k] * _B[_k, :]
+                    if _Cf is not None:
+                        _sum = _sum + (_Cf[_i] if _Cf.ndim == 2 else _Cf)
+                    _Y[_i] = _sum
+                return [_Y]
             return [(alpha * np.matmul(A, B) + beta * C).astype(A.dtype)]
 
     if op == "Conv":
@@ -559,7 +586,15 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
             mn = np.asarray(mean).reshape(shp); vr = np.asarray(var).reshape(shp)  # -- QW
         else:  # -- QW
             sc, bs, mn, vr = scale, bias, mean, var  # -- QW
-        y = (sc * (x - mn) / np.sqrt(vr + eps) + bs).astype(x.dtype)  # -- QW
+        # [exp11-orig] y = (sc * (x - mn) / np.sqrt(vr + eps) + bs).astype(x.dtype)  # -- QW
+        # exp11 L1 step 2 (2026-09-06): mirror the BP-inherited device PULP_BatchNormInternal_fp32 frozen path
+        # bit-for-bit: per-channel inv_std = 1.0f / sqrtf(running_var + eps); y = ((x - mean) * inv_std) * g + b
+        # (C left-assoc), all fp32. The host previously applied gamma FIRST and DIVIDED by sqrt -> a different
+        # fp32 rounding sequence; block-4's BN feeds GAP->fc->SCE in fp32 with no int8 round to absorb it. -- QW
+        _x32 = x.astype(np.float32); _eps32 = np.float32(eps)
+        _mn, _vr, _sc, _bs = (np.asarray(a, np.float32) for a in (mn, vr, sc, bs))
+        _inv_std = np.float32(1.0) / np.sqrt(_vr + _eps32)                    # fp32 sqrt is IEEE-exact == sqrtf
+        y = (((_x32 - _mn) * _inv_std) * _sc + _bs).astype(np.float32)
         saved_mean = mean1.astype(np.float32)  # -- QW: frozen: saved == running -- QW
         saved_inv_std = (1.0 / np.sqrt(var1 + eps)).astype(np.float32)  # -- QW
         return [y, mean1.astype(np.float32), var1.astype(np.float32), saved_mean, saved_inv_std]  # -- QW
@@ -626,7 +661,17 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
 
     if op == "GlobalAveragePool":
         x = inputs[0]
-        return [np.mean(x, axis=tuple(range(2, x.ndim)), keepdims=True)]
+        # [exp11-orig] return [np.mean(x, axis=tuple(range(2, x.ndim)), keepdims=True)]
+        # exp11 L2 step 1 (2026-09-06): mirror PULP_GlobalAveragePool_fp32 bit-for-bit: per (n,c) a SEQUENTIAL
+        # fp32 `sum += input[i]` over HW in memory order, then `sum * inv_HW` with inv_HW = 1.0f/(float32_t)HW
+        # (reciprocal-MULTIPLY). np.mean uses a blocked/pairwise sum and DIVIDES -> different fp32 rounding. -- QW
+        _x32 = x.astype(np.float32); _N, _C = _x32.shape[:2]
+        _flat = _x32.reshape(_N, _C, -1); _HW = _flat.shape[-1]
+        _acc = np.zeros((_N, _C), np.float32)
+        for _i in range(_HW):
+            _acc = _acc + _flat[:, :, _i]                                       # sequential, same order as the C loop
+        _inv_HW = np.float32(1.0) / np.float32(_HW)
+        return [(_acc * _inv_HW).reshape((_N, _C) + (1,) * (x.ndim - 2)).astype(np.float32)]
     if op == "GlobalMaxPool":
         x = inputs[0]
         return [np.max(x, axis=tuple(range(2, x.ndim)), keepdims=True)]
@@ -801,8 +846,20 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
     if op == "SoftmaxCrossEntropyLoss":
         logits = inputs[0]
         labels = inputs[1]
-        xm = np.max(logits, axis=-1, keepdims=True)
-        lp = logits - xm - np.log(np.sum(np.exp(logits - xm), axis=-1, keepdims=True))
+        # [exp11-orig] xm = np.max(logits, axis=-1, keepdims=True)
+        # [exp11-orig] lp = logits - xm - np.log(np.sum(np.exp(logits - xm), axis=-1, keepdims=True))
+        # exp11 L2 step 3 (2026-09-06): mirror the device SoftmaxCrossEntropyLoss template's ORDER bit-for-bit:
+        # max (exact), d = logit - max, sum_exp = SEQUENTIAL fp32 `+= expf(d_j)` over classes j=0..C-1, lse = logf(sum),
+        # lp = (logit - max) - lse. np.sum is blocked/pairwise -> different fp32 rounding. The transcendentals here
+        # are still np.exp/np.log (numpy float32 loops) vs picolibc expf/logf on the device = the L4 residual. -- QW
+        _lg = logits.astype(np.float32)
+        xm = np.max(_lg, axis=-1, keepdims=True)
+        _d = _lg - xm
+        _e = np.exp(_d).astype(np.float32)
+        _se = np.zeros(_d.shape[:-1] + (1,), np.float32)
+        for _j in range(_d.shape[-1]):
+            _se = _se + _e[..., _j:_j + 1]                                   # sequential, class order
+        lp = _d - np.log(_se).astype(np.float32)
         if labels.dtype in (np.int32, np.int64):
             nll = -lp[np.arange(logits.shape[0]), labels.flatten()]
         else:
@@ -821,32 +878,61 @@ def _exec_standard(op: str, inputs: List, attrs: Dict[str, Any]) -> List[np.ndar
 
 def _exec_deeploy(op: str, inputs: List, attrs: Dict[str, Any], add_is_initializer: bool = True) -> List[np.ndarray]:
     if op == "Quant":
-        x = inputs[0].astype(np.float64)
-        # QW: support BOTH conventions — DeepQuant emits scale/zp as node INPUTS, while
-        #     create_quant_pipeline's fold_qcdq_to_quant_dequant emits them as ATTRIBUTES.
-        #     Fall back to attrs when the inputs aren't present. -- QW
+        # [exp11-orig] x = inputs[0].astype(np.float64)
+        # [exp11-orig] # QW: support BOTH conventions — DeepQuant emits scale/zp as node INPUTS, while
+        # [exp11-orig] #     create_quant_pipeline's fold_qcdq_to_quant_dequant emits them as ATTRIBUTES.
+        # [exp11-orig] #     Fall back to attrs when the inputs aren't present. -- QW
+        # [exp11-orig] if len(inputs) >= 3:
+        # [exp11-orig] scale = inputs[1].astype(np.float64); zp = inputs[2].astype(np.float64)
+        # [exp11-orig] else:
+        # [exp11-orig] scale = np.asarray(attrs["scale"], np.float64); zp = np.asarray(attrs.get("zero_point", 0.0), np.float64)
+        # [exp11-orig] bits = int(attrs.get("bit_width", attrs.get("bits", 8)))
+        # [exp11-orig] signed = bool(attrs.get("signed", True))
+        # [exp11-orig] qmin = -(2 ** (bits-1)) if signed else 0
+        # [exp11-orig] qmax = (2 ** (bits-1)) - 1 if signed else (2**bits) - 1
+        # [exp11-orig] # QW: match the device QuantTemplate rounding — `(int32_t)(v + 0.5f*(v>=0?1:-1))` = round-HALF-AWAY-
+        # [exp11-orig] #     from-zero, NOT np.round's round-half-to-even. They differ at .5 boundaries → ±1 int8, which
+        # [exp11-orig] #     accumulates over C>1 inter-block quant (block-0 C=1 hid it; block-1 diverges). -- QW
+        # [exp11-orig] _v = x / scale
+        # [exp11-orig] _q = np.trunc(_v + np.where(_v >= 0.0, 0.5, -0.5))
+        # [exp11-orig] return [np.clip(_q + zp, qmin, qmax).astype(np.int8 if signed else np.uint8)]
+        # exp11 L1 (2026-09-06): mirror the SHIPPED QuantTemplate bit-for-bit. Shipped MULTIPLIES
+        # (`scaled_val = input_val * scale`, "Multiply instead of divide"); our exporter emits the ONNX step
+        # size s in `scale`, so the device parser passes the fp64 reciprocal 1.0/float(s), which the template
+        # casts to (float32_t). The host previously DIVIDED by s in fp64 -> a different op in a different
+        # domain (1-12 ulp off the device at step 0). Now: fp32, multiply by the IDENTICAL fp32 reciprocal,
+        # zero_point added BEFORE rounding (template order), +-0.5f then truncating cast, then clamp. -- QW
+        x = inputs[0].astype(np.float32)
         if len(inputs) >= 3:
-            scale = inputs[1].astype(np.float64); zp = inputs[2].astype(np.float64)
+            _inv = (1.0 / np.asarray(inputs[1], np.float64)).astype(np.float32); _zp = np.asarray(inputs[2], np.float32)
         else:
-            scale = np.asarray(attrs["scale"], np.float64); zp = np.asarray(attrs.get("zero_point", 0.0), np.float64)
+            _inv = np.float32(1.0 / float(attrs["scale"])); _zp = np.float32(float(attrs.get("zero_point", 0.0)))
         bits = int(attrs.get("bit_width", attrs.get("bits", 8)))
         signed = bool(attrs.get("signed", True))
         qmin = -(2 ** (bits-1)) if signed else 0
         qmax = (2 ** (bits-1)) - 1 if signed else (2**bits) - 1
-        # QW: match the device QuantTemplate rounding — `(int32_t)(v + 0.5f*(v>=0?1:-1))` = round-HALF-AWAY-
-        #     from-zero, NOT np.round's round-half-to-even. They differ at .5 boundaries → ±1 int8, which
-        #     accumulates over C>1 inter-block quant (block-0 C=1 hid it; block-1 diverges). -- QW
-        _v = x / scale
-        _q = np.trunc(_v + np.where(_v >= 0.0, 0.5, -0.5))
-        return [np.clip(_q + zp, qmin, qmax).astype(np.int8 if signed else np.uint8)]
+        _scaled = x * _inv                                                    # fp32 mul (device: input_val * (float32_t)scale)
+        _shifted = _scaled + _zp                                              # fp32 add, zp BEFORE round
+        _half = np.where(_shifted >= 0, np.float32(0.5), np.float32(-0.5)).astype(np.float32)
+        _q = np.trunc(_shifted + _half)                                       # (int32_t) cast: truncate toward zero
+        return [np.clip(_q, qmin, qmax).astype(np.int8 if signed else np.uint8)]
 
     if op == "Dequant":
-        q = inputs[0].astype(np.float64)
-        if len(inputs) >= 3:                                   # QW: input- vs attribute-scale (see Quant) -- QW
-            scale = inputs[1].astype(np.float64); zp = inputs[2].astype(np.float64)
+        # [exp11-orig] q = inputs[0].astype(np.float64)
+        # [exp11-orig] if len(inputs) >= 3:                                   # QW: input- vs attribute-scale (see Quant) -- QW
+        # [exp11-orig] scale = inputs[1].astype(np.float64); zp = inputs[2].astype(np.float64)
+        # [exp11-orig] else:
+        # [exp11-orig] scale = np.asarray(attrs["scale"], np.float64); zp = np.asarray(attrs.get("zero_point", 0.0), np.float64)
+        # [exp11-orig] return [((q - zp) * scale).astype(np.float32)]
+        # exp11 L1 (2026-09-06): mirror the shipped DequantTemplate in fp32:
+        # ((float32_t)q - (float32_t)zp) * (float32_t)scale. Previously fp64 then cast (double rounding). -- QW
+        q = inputs[0].astype(np.float32)
+        if len(inputs) >= 3:
+            _s = np.asarray(inputs[1], np.float32); _zp = np.asarray(inputs[2], np.float32)
         else:
-            scale = np.asarray(attrs["scale"], np.float64); zp = np.asarray(attrs.get("zero_point", 0.0), np.float64)
-        return [((q - zp) * scale).astype(np.float32)]
+            _s = np.float32(float(attrs["scale"])); _zp = np.float32(float(attrs.get("zero_point", 0.0)))
+        _shifted = q - _zp
+        return [(_shifted * _s).astype(np.float32)]
 
     if op == "RequantShift":
         x = inputs[0].astype(np.int64)

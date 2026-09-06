@@ -87,23 +87,32 @@ and implement it identically on both sides:
   + SCE template), so the int8 fast path is untouched. Shipped originals kept commented
   alongside per the project rule.
 
-## 4. Plan
+## 4. Plan — ordered by ownership, one level at a time (user direction, 2026-09-06)
 
-| phase | work | exit criterion |
-|---|---|---|
-| **P0** | this Plan; `exp11/` layout | Plan.md committed |
-| **P1 host mirror** | Rewrite `run_onnx_graph` Quant, Dequant, BatchNormInternal, GlobalAveragePool, Gemm(transB), SCE in np.float32 in the device's exact op order; shared `expf`/`logf` in numpy | host graph still yields 83.33% zero-shot / same argmax; per-op unit tests vs a C reference of each kernel (compiled strict on host) diff=0 |
-| **P2 device strict** | `#pragma clang fp contract(off)`+`reassociate(off)` on BatchNorm.c, GlobalAveragePool.c, Gemm.c, SCE template; replace `expf`/`logf` calls with the shared implementation; verify the Quant scale literal is emitted with full repr | builds; single forward loss bit-exact to P1 host (diff=0) at step 0 for all 4 accum samples |
-| **P3 single-step** | 2-step on-device run vs host | all losses + updated weights diff=0 |
-| **P4 full round-1** | 2700-step device run (kill orphan gvsoc by PID first), decode all 10800 `lp_bits`, compare vs host `loss_plus`; compare final weights; device eval accuracy | **0 / 10800 loss mismatches, 0 weight mismatches**; accuracy reported |
-| **P5** | Findings.md: accepted diffs with snippets, results, residual risks; last section = plan for item 2 (faithful PyTorch sim for retuning) | committed |
+**Method.** Do not flip all mismatches at once. Fix one *level* at a time, then measure; only
+descend a level if a residual remains. Order the levels by *ownership and specificity*: the
+code we wrote for QZO first, the shared repo infrastructure last. The shipped device kernels
+are the semantic reference our host must be faithful to — we do not alter them or the
+compiler unless faithful mirroring is provably impossible.
 
-Risks / checks carried into P2–P4: (a) Mako must render the Quant/Dequant `${scale}` with
-full `repr` (else the host cannot reproduce the fp32 literal) — verify on generated C;
-(b) any remaining `float64` promotion in numpy scalar ops (guard with explicit `np.float32`);
-(c) confirm the device training build takes the frozen-BN branch (`BN_FROZEN_STATS`);
-(d) multi-core chunking of GAP/BN/Quant is per-element/per-channel, so core split does not
-change reduction order — verify for Gemm (M=1 ⇒ single core).
+**Measurement (host-only for L1–L2, no device rebuild).** The existing round-1 device log
+already holds all 10800 +eps loss bit-patterns (`lp_bits=0x..`). After each level: recompute
+the host reference and count bit-exact matches. Checkpoints: (a) **step 0** (identical
+weights) must go 0/4 → 4/4 = the forward is aligned; (b) the first step at which the carry
+diverges = how far the alignment reaches.
+
+| level | ownership | change (host unless stated) | measure |
+|---|---|---|---|
+| **L1** | ours (`-- QW` handlers) | Quant: fp32, `x * fp32(1.0/s)`, zp **before** round; Dequant: fp32; BN: `inv_std=1/sqrt(var+eps)`, `((x-mean)*inv_std)*g+b` | step-0 4/4? matches/10800? first-divergence step |
+| **L2** | ours-adjacent (host faithfulness to shipped kernels) | GAP: seq sum, `*(1/HW)`; Gemm: mirror 6-way unroll; SCE: seq `sum+=exp`, `/batch` | same |
+| **L3** | general repo (compiler) | only if L2 leaves residual: scoped `fp contract(off)`/`reassociate(off)` on fp32 kernels → device rebuild | same, on a new device run |
+| **L4** | general repo (libm) | only if L3 leaves residual: shared deterministic `expf`/`logf` both sides | same |
+| **P-final** | — | full round-1 device run bit-exact vs final host ref (re-run if any device change; else the existing log *is* the demonstration); weights + eval accuracy | 0/10800 loss mismatches, 0 weight mismatches |
+| **P5** | — | Findings.md (accepted diffs + snippets, per-level results, what each level bought); last section = plan for item 2 (faithful PyTorch sim) | committed |
+
+Risks carried: Mako must render Quant `${scale}` with full `repr` (check generated C when a
+device build happens); guard numpy fp64 promotion with explicit `np.float32`; confirm device
+training build takes the frozen-BN branch.
 
 ## 5. Files (to be produced here)
 `Plan.md` (this) · `Findings.md` · `host_mirror/` (aligned numpy ops + unit tests) ·

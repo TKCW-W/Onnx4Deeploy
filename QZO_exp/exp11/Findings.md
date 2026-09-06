@@ -67,9 +67,17 @@ feedback compounds. **Whether this refutes master weights for fidelity is an OPE
 depends on lr — master's operating point was 3e-6, not the 1e-5 used here — and on the surrogate's fidelity to a real
 device implementation); to be discussed after exp12. Not a conclusion.
 
-## 5. Pending — exp12 control (running)
-Device round-1 at lr 3e-6 (int8 update inert) vs its host reference; `Errors:` count compared with 16565/21600.
-Prediction stated before the run: the count will not change much (float part). See `exp12/Plan.md`.
+## 5. Device-level controls (exp12, exp13) — DONE
+| run | int path | errors / 21,600 | final int params device vs host |
+|---|---|---|---|
+| 1e-5 | weights + biases train | 16,565 (76.7%) | all differ |
+| 3e-6 (exp12) | weights frozen, biases train | 4,254 (19.7%) | weights exact, biases 81/104 differ |
+| 3e-6 frozen (exp13) | weights + biases frozen | 5,838 (27.0%) | **all 10 int tensors bit-exact** |
+The residual with the int path fully inert is the **float path**: fp32-parameter drift seeded by the fp32 tail's ulp
+difference and amplified by the activation Quant. The int8 weight path adds ×4 at 1e-5; the bias path is not an
+amplifier. Since every other op is now identical, removing the tail seed (L3/L4) would make the whole carry bit-exact
+(diff = 0). Details: `exp12/Findings.md`, `exp13/Findings.md`. Master-weight question: exp13 is the device-level
+"fp32-only" bound — any scheme that leaves the tail seed in place inherits at least this divergence.
 
 ## 6. Plan for item 2 — a faithful PyTorch simulation to retune the on-device QZO setting
 The Brevitas fake-quant sim (actor A) is ~2 pt optimistic and diverges from the device at zero-shot (85.00 vs 83.33) because

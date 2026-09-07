@@ -65,6 +65,39 @@ def build_folded(calib: str):
     mw.log(f"trainable params: {len(params)} (all quantized; BN folded)")
     return model, params, trX, trY, evX, evY, mw.act_scales(model)
 
+def run_regime_lsb(model, params, trX, trY, evX, evY, mode, lr, K, n_steps=None, tag=""):
+    """Scale-invariant LSB-domain ZO (exp14): every quantized weight is perturbed by K of ITS OWN quant steps
+    (d = K*z LSB), g = (L+ - L-)/(2*K*n_accum), update = round(-lr*g*z) LSB (direct_lsb: int grid is the state;
+    master_lsb: latent fp32 in LSB units, read out by round). Same z draw (mw.draw_z) as the other regimes."""
+    import torch.nn.functional as TF
+    n_steps = n_steps or mw.N_STEPS; t0 = time.time()
+    state = {p["name"]: mw.q_int(p["init"], p) for p in params}; init_int = {n: v.clone() for n, v in state.items()}
+    lat = {n: v.clone() for n, v in state.items()} if mode == "master_lsb" else None
+    Xt, Yt = torch.from_numpy(trX), torch.from_numpy(trY); zero_steps = 0
+    conv_w = [p["name"] for p in params if p["name"].startswith("blocks") and p["name"].endswith(".conv.weight")]
+    for u in range(n_steps):
+        z = mw.draw_z(params, u); idx = [(u * mw.N_ACCUM + a) % mw.N_TRAIN for a in range(mw.N_ACCUM)]; xb, yb = Xt[idx], Yt[idx]
+        cur = state if lat is None else {n: torch.clamp(torch.round(lat[n]), p["lo"], p["hi"]) for n, p in zip([q["name"] for q in params], params)}
+        with torch.no_grad():
+            mw.install(params, cur, "direct", {n: K * z[n] for n in cur}, None); Lp = float(TF.cross_entropy(model(xb), yb, reduction="sum"))
+            mw.install(params, cur, "direct", {n: -K * z[n] for n in cur}, None); Lm = float(TF.cross_entropy(model(xb), yb, reduction="sum"))
+        g = (Lp - Lm) / (2.0 * K * mw.N_ACCUM); moved = 0
+        for p in params:
+            n = p["name"]
+            if lat is None:
+                d = torch.round(-lr * g * z[n]); state[n] = torch.clamp(state[n] + d, p["lo"], p["hi"]); moved += int((d != 0).sum())
+            else: lat[n] = torch.clamp(lat[n] + (-lr * g * z[n]), p["lo"], p["hi"])
+        if lat is None and moved == 0: zero_steps += 1
+        if u % 300 == 0: mw.log(f"     [{tag}] u{u} L+={Lp:.4f} L-={Lm:.4f} g={g:+.4f}")
+    final = state if lat is None else {n: torch.clamp(torch.round(lat[n]), p["lo"], p["hi"]) for n, p in zip([q["name"] for q in params], params)}
+    with torch.no_grad(): mw.install(params, final, "direct", None, None)
+    acc = mw.evaluate(model, evX, evY); tot = sum(int(init_int[n].numel()) for n in conv_w)
+    mv = 100.0 * sum(int((final[n] != init_int[n]).sum()) for n in conv_w) / tot
+    r = dict(mode=mode, lr_lsb=lr, K_lsb=K, n_steps=n_steps, balanced_accuracy=acc["balanced_accuracy"], overall_accuracy=acc["overall_accuracy"],
+             cum_convW_moved_pct=mv, pct_steps_zero_move=100.0 * zero_steps / n_steps, seconds=time.time() - t0)
+    mw.log(f"[{tag}] DONE bal_acc={r['balanced_accuracy']:.2f}%  convW moved={mv:.1f}%  zero-move steps={r['pct_steps_zero_move']:.1f}%  ({r['seconds']:.0f}s)")
+    return r
+
 def main():
     HERE = os.path.dirname(os.path.abspath(__file__))
     calib = os.environ.get("CALIB", "absmax"); mw.log(f"[exp14] calibration = {calib}")
@@ -74,8 +107,9 @@ def main():
     out = {"design": "BN folded into QuantConv2d (weight+bias), BN->Identity", "calibration": calib, "zero_shot": zs,
            "n_trainable": len(params), "kinds": {k: sum(p["kind"] == k for p in params) for k in ("quant", "float")}, "runs": {}}
     for spec in regimes:
-        mode, lr = spec.split("@"); lr = float(lr)
-        t0 = time.time(); r = mw.run_regime(model, params, trX, trY, evX, evY, mode, lr, tag=spec)
+        mode, lr = spec.split("@"); lr = float(lr); t0 = time.time()
+        if mode.endswith("_lsb"): r = run_regime_lsb(model, params, trX, trY, evX, evY, mode, lr, float(os.environ.get("EPS_LSB", "1")), tag=spec)
+        else: r = mw.run_regime(model, params, trX, trY, evX, evY, mode, lr, tag=spec)
         r["seconds"] = time.time() - t0; out["runs"][spec] = r
         mw.log(f"[exp14] {spec}: bal_acc={r.get('balanced_accuracy', float('nan')):.2f}%  ({r['seconds']:.0f}s)")
         with open(os.path.join(HERE, os.environ.get("RESULTS", "results.json")), "w") as f: json.dump(out, f, indent=2, default=float)

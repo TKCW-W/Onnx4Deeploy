@@ -36,3 +36,16 @@ EXTRA=x CALIB=pooled@99.9 RESULTS=zs.json REGIMES= python3 fold_bn_sim.py      #
 ```
 Caveat (as in exp10): the Brevitas fake-quant sim is ~2 pt optimistic vs the true int8 datapath; used here for the
 RELATIVE comparison folded vs unfolded under one simulator. fc is quantized (harness convention), unlike the device's fc-float.
+
+## Why absolute eps fails after folding (measured, pooled@100)
+| param | folded s_w range | round(eps/s_w) LSB (eps=0.01) | \|w\|max | unfolded round(eps/s) |
+|---|---|---|---|---|
+| blocks.0.conv.weight | 1.7e-5 … 9.0e-5 | **112 … 591** (> the 254-LSB grid) | 0.0114 | 2 … 7 |
+| blocks.1.conv.weight | 4.9e-4 … 1.3e-3 | 7 … 20 | 0.17 | 6 … 9 |
+| blocks.2/3/4.conv.weight | 1.1e-3 … 6.4e-3 | 2 … 9 | 0.45–0.81 | 4 … 9 |
+| conv biases / fc.bias | 7e-5 … 3.5e-3 | 3 … 152 | | 0 … 125 |
+Folding scales block-0's weights by γ/σ = 0.005–0.06, so the device-style perturbation `round(eps/s_w)·z` with an absolute
+eps saturates block 0 in every ±eps forward → ZO estimate is noise → training degrades (absmax: direct@1e-5 78.3→73.9;
+pooled@99.99: direct@3e-6 80.6→65.6). Remedy under test: scale-invariant LSB-domain ZO (`direct_lsb`/`master_lsb`):
+perturb each weight by K of its own steps, g=(L+−L−)/(2·K·n_accum), update round(−lr_lsb·g·z) LSB. Sweep at pooled@100:
+K=1, lr_lsb ∈ {1,3,10,30,100} direct, {1,3,10} master → `results_pooled100_lsb1.json`.

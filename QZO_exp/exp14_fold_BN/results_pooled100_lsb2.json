@@ -1,0 +1,86 @@
+{
+  "design": "BN folded into QuantConv2d (weight+bias), BN->Identity",
+  "calibration": "pooled@100",
+  "zero_shot": {
+    "balanced_accuracy": 85.55555555555556,
+    "overall_accuracy": 85.55555555555556,
+    "per_class_recall": {
+      "0": 1.0,
+      "1": 0.7,
+      "2": 0.85,
+      "3": 0.8,
+      "4": 1.0,
+      "5": 0.9,
+      "6": 0.85,
+      "7": 0.7,
+      "8": 0.9
+    }
+  },
+  "n_trainable": 12,
+  "kinds": {
+    "quant": 12,
+    "float": 0
+  },
+  "runs": {
+    "direct_lsb@3": {
+      "mode": "direct_lsb",
+      "lr_lsb": 3.0,
+      "K_lsb": 2.0,
+      "lr_f": null,
+      "n_steps": 2700,
+      "balanced_accuracy": 85.55555555555556,
+      "overall_accuracy": 85.55555555555556,
+      "cum_convW_moved_pct": 0.0,
+      "pct_steps_zero_move": 100.0,
+      "seconds": 166.7353641986847
+    },
+    "direct_lsb@10": {
+      "mode": "direct_lsb",
+      "lr_lsb": 10.0,
+      "K_lsb": 2.0,
+      "lr_f": null,
+      "n_steps": 2700,
+      "balanced_accuracy": 85.00000000000001,
+      "overall_accuracy": 85.0,
+      "cum_convW_moved_pct": 99.88575268817205,
+      "pct_steps_zero_move": 94.18518518518519,
+      "seconds": 166.49595618247986
+    },
+    "master_lsb@0.3": {
+      "mode": "master_lsb",
+      "lr_lsb": 0.3,
+      "K_lsb": 2.0,
+      "lr_f": null,
+      "n_steps": 2700,
+      "balanced_accuracy": 85.00000000000001,
+      "overall_accuracy": 85.0,
+      "cum_convW_moved_pct": 30.228494623655912,
+      "pct_steps_zero_move": 0.0,
+      "seconds": 167.61080241203308
+    },
+    "master_lsb@1": {
+      "mode": "master_lsb",
+      "lr_lsb": 1.0,
+      "K_lsb": 2.0,
+      "lr_f": null,
+      "n_steps": 2700,
+      "balanced_accuracy": 86.66666666666667,
+      "overall_accuracy": 86.66666666666667,
+      "cum_convW_moved_pct": 72.86962365591398,
+      "pct_steps_zero_move": 0.0,
+      "seconds": 168.78663802146912
+    },
+    "master_lsb@3": {
+      "mode": "master_lsb",
+      "lr_lsb": 3.0,
+      "K_lsb": 2.0,
+      "lr_f": null,
+      "n_steps": 2700,
+      "balanced_accuracy": 86.66666666666667,
+      "overall_accuracy": 86.66666666666667,
+      "cum_convW_moved_pct": 90.12768817204301,
+      "pct_steps_zero_move": 0.0,
+      "seconds": 166.8585398197174
+    }
+  }
+}

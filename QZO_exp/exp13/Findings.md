@@ -45,3 +45,68 @@ conv+requant outputs 0 differing elements); **the first difference appears at BN
 max 4) and is re-created by every BatchNormInternal (25–46%), absorbed by the following Quant, and reaches the loss only
 through BN-4 → GAP → fc (logits 7/9 at 1–2 ulp → loss 5 ulp). The int path does not participate. Causal one-kernel
 confirmation (strict-fp BatchNorm.c, re-run probe 1 → expect 0) proposed, awaiting go/no-go.
+
+## Reproduction — bit-exact round-1 on device with the fixes applied (2026-09-07)
+
+Repo state: Onnx4Deeploy ≥ `e3aa35f` (host mirrors in `onnx4deeploy/utils/onnx_node_implementations.py`, `QZO_FREEZE_CONV`
+in the exporter, `qzo_transform.freeze_conv_pmul`), TrainDeeploy ≥ `4674b3e` (strict-fp32 CMake options) + `1a17208`
+(harness `OUTPUT_TOL`/`OUTPUT_BITS`, only needed for the layer probes). Containers: `agitated_hugle` (Onnx4Deeploy at
+`/app/Onnx4Deeploy`, TrainDeeploy at `/app/TrainDeeploy`, SilentWear at `/app/SilentWear`), `traindeeploy` (the ETH tree at
+`/app/ETH/...`, device toolchain + GVSoC). Setting: lr 3e-6, eps 0.01, n_accum 4, seed 42, 2700 steps, 54 windows,
+pooled@99.99 thresholds, frozen-stats BN, conv weight+bias frozen (only the 12 fp32 params train).
+
+**1. Host reference + fixture (agitated_hugle, ~4.5 h; already produced: `exp13/baked_3e6_freeze_ref/`)**
+```bash
+docker exec -d agitated_hugle bash -c "cd /app/Onnx4Deeploy && QZO_FREEZE_CONV=1 \
+  QZO_POOLED_THRESHOLDS=/app/TrainDeeploy/DeeployTest/experiments/deliverable/exp9_QZO_round1/fixture/pooled_9999_fold3.json \
+  python3 Onnx4Deeploy.py -model SpeechNet -mode q-zo-train --noise-type rqs_rademacher \
+    --dataset silentwear --data-path /app/SilentWear/SilentWear_data/data_raw_and_filt \
+    --pretrained-weights /app/SilentWear/SilentWear/artifacts/models/inter_session_ft/S01/vocalized/speechnet/w1400ms/model_1/leave_one_session_out_fold_3.pt \
+    --subject S01 --session 3 --condition vocalized --batch 1 --data-size 54 --stratified \
+    --n-epochs 200 --n-accum 4 --lr 3e-6 --bn-frozen-stats \
+    -o /app/Onnx4Deeploy/QZO_exp/exp13/baked_3e6_freeze_ref > /app/Onnx4Deeploy/QZO_exp/exp13/export_3e6_freeze.log 2>&1"
+```
+Check: the log shows `[QZO_FREEZE_CONV] zeroed 10 *_pmul initializers` for both graphs and
+`QZO multi-step sim: data_size=54 n_accum=4 → n_steps=2700 lr=3e-06 eps=0.01 seed=42`.
+(For the un-frozen or 1e-5 variants drop `QZO_FREEZE_CONV=1` / change `--lr`; the graphs and `inputs.npz` are lr-independent.)
+
+**2. Optional 10-second smoke (host step-0 bits)**: `docker exec agitated_hugle python3 /app/Onnx4Deeploy/QZO_exp/exp13/check_step0_freeze.py`
+→ `3eb41bcd 3f09326b 3d4011cf 3efd62eb`; the device's first four `lp_bits` must match these with the strict build.
+
+**3. Pack the device fixture (traindeeploy)** — from the export dir itself, so its `outputs.npz` is the compiled-in reference
+and the harness's printed `Errors:` line is the result directly (my run packed from `baked_3e6_freeze`, a byte-identical
+graph copy with a placeholder reference, and used the recount below instead):
+```bash
+docker exec traindeeploy bash -c 'cd /app/ETH/TrainDeeploy/DeeployTest && rm -rf TEST_SIRACUSA && \
+  python3 experiments/zo_smoke/pack_2step_fixture.py /app/ETH/Onnx4Deeploy/QZO_exp/exp13/baked_3e6_freeze_ref \
+    /app/ETH/TrainDeeploy/DeeployTest/Tests/Models/Training/SpeechNet speechnet_qzo_lr3e6_freeze_train speechnet_qzo_lr3e6_freeze_update'
+```
+
+**4. Device round-1 with the strict-fp32 build (traindeeploy, ~3.5 h)** — kill orphan GVSoC by PID first:
+```bash
+pgrep -f "[g]vsoc_launcher" | xargs kill -9
+docker exec -d traindeeploy bash -c 'cd /app/ETH/TrainDeeploy/DeeployTest && \
+  python3 deeployMezoRunner_tiled_siracusa.py \
+    -t Tests/Models/Training/SpeechNet/speechnet_qzo_lr3e6_freeze_train \
+    --optimizer-dir Tests/Models/Training/SpeechNet/speechnet_qzo_lr3e6_freeze_update \
+    --n-steps 2700 --n-accum 4 --num-data-inputs 2 --eps 0.01 --lr 3e-6 --q 1 --seed 42 \
+    --l1 128000 --l2 2000000 --cores 8 \
+    -D BN_FROZEN_STATS=ON DUMP_WEIGHTS=ON DEEPLOY_STRICT_FP32=ON \
+       "DEEPLOY_STRICT_FP32_FILES=BatchNorm.c;Gemm.c;GlobalAveragePool.c;RandomNoise.c" \
+    > /app/ETH/Onnx4Deeploy/QZO_exp/exp13/micro/device_round1_3e6_freeze_strict.log 2>&1'
+```
+Check in the log: 5 `[QW strict-fp32]` lines (4 kernels + generated graphs), `[BN_FROZEN_STATS]`, 10800 `lp_bits` + 10800 `lm_bits`,
+22 `[WDUMP ...]` lines. Without the two strict `-D`s the same command reproduces the fast-math result (5,838 errors).
+
+**5. Verify**
+```bash
+# (a) losses: harness rule + per-band bit-level breakdown (host-side)
+python3 QZO_exp/exp13/verify_bitexact.py QZO_exp/exp13/micro/device_round1_3e6_freeze_strict.log[.gz] QZO_exp/exp13/baked_3e6_freeze_ref/outputs.npz
+# (b) final parameters: bit-compare the device dump against the host's updated_* tensors
+python3 TrainDeeploy/DeeployTest/experiments/deliverable/exp9_QZO_round1/extract_qzo_weights.py \
+  --gvsoc-log <log> --train-onnx QZO_exp/exp13/baked_3e6_freeze_ref/network_zo_train.onnx \
+  --out /tmp/dev_w.npz --ref-outputs QZO_exp/exp13/baked_3e6_freeze_ref/outputs.npz
+```
+Expected: `recount (harness rule): 0 out of 21600`, first LARGE step `None`, 0.0% LARGE in every band, median rel
+2.8e-8 … 6.6e-8 (≤ 1 ulp), 5–24% bit-exact per band; `15 bit-exact, 7 differ` with max 1.49e-8 / 2.24e-8 (= 1 ulp) on
+BN β and fc. Actual run: `micro/strict_round1_analysis.txt`.

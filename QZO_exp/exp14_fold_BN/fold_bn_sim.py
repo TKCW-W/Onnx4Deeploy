@@ -46,6 +46,11 @@ def build_folded(calib: str):
     trX = np.concatenate([np.asarray(a, np.float32) for a in X], 0); trY = np.asarray([int(np.asarray(y).reshape(-1)[0]) for y in Y], np.int64)
     e2 = mw.make_exporter(2); i2, l2 = e2.get_data_source()._load_windows(); evX = np.concatenate(i2, 0); evY = np.concatenate(l2, 0)
     model = e1.create_brevitas_model(); model.eval()
+    FC_FLOAT = os.environ.get("FC_FLOAT", "0") == "1"
+    if FC_FLOAT:   # device design: fc in fp32 on the fp32 GAP output (no fc input quant), trained as a smooth float param
+        lin = nn.Linear(model.fc.in_features, model.fc.out_features)
+        lin.weight.data = model.fc.weight.detach().clone(); lin.bias.data = model.fc.bias.detach().clone()
+        model.fc = lin; model.fc_iq = nn.Identity(); mw.log("[exp14] FC_FLOAT: fc -> fp32 nn.Linear, fc input quant removed")
     with torch.no_grad(), calibration_mode(model): model(torch.from_numpy(trX[:mw.CALIB_SAMPLES]))
     model.eval()
     if calib.startswith("pooled@"):
@@ -62,6 +67,9 @@ def build_folded(calib: str):
         s_b = (s_in * s_w).reshape(-1)
         params.append(dict(name=f"{name}.bias", mod=m, attr="bias", kind="quant", scale=s_b, lo=-(2 ** 31) + 1, hi=2 ** 31 - 1, init=m.bias.detach().clone()))
     for p in params: p["dz_int"] = torch.round(mw.EPS / p["scale"])
+    if FC_FLOAT:
+        params.append(dict(name="fc.weight", mod=model.fc, attr="weight", kind="float", scale=None, init=model.fc.weight.detach().clone()))
+        params.append(dict(name="fc.bias", mod=model.fc, attr="bias", kind="float", scale=None, init=model.fc.bias.detach().clone()))
     mw.log(f"trainable params: {len(params)} (all quantized; BN folded)")
     return model, params, trX, trY, evX, evY, mw.act_scales(model)
 
@@ -71,29 +79,32 @@ def run_regime_lsb(model, params, trX, trY, evX, evY, mode, lr, K, n_steps=None,
     master_lsb: latent fp32 in LSB units, read out by round). Same z draw (mw.draw_z) as the other regimes."""
     import torch.nn.functional as TF
     n_steps = n_steps or mw.N_STEPS; t0 = time.time()
-    state = {p["name"]: mw.q_int(p["init"], p) for p in params}; init_int = {n: v.clone() for n, v in state.items()}
-    lat = {n: v.clone() for n, v in state.items()} if mode == "master_lsb" else None
+    Q = [p for p in params if p["kind"] == "quant"]; FL = [p for p in params if p["kind"] == "float"]; lr_f = float(os.environ.get("LR_F", "1e-5"))
+    state = {p["name"]: mw.q_int(p["init"], p) for p in Q}; state.update({p["name"]: p["init"].clone() for p in FL}); init_int = {p["name"]: state[p["name"]].clone() for p in Q}
+    lat = {p["name"]: state[p["name"]].clone() for p in Q} if mode == "master_lsb" else None
     Xt, Yt = torch.from_numpy(trX), torch.from_numpy(trY); zero_steps = 0
     conv_w = [p["name"] for p in params if p["name"].startswith("blocks") and p["name"].endswith(".conv.weight")]
     for u in range(n_steps):
         z = mw.draw_z(params, u); idx = [(u * mw.N_ACCUM + a) % mw.N_TRAIN for a in range(mw.N_ACCUM)]; xb, yb = Xt[idx], Yt[idx]
-        cur = state if lat is None else {n: torch.clamp(torch.round(lat[n]), p["lo"], p["hi"]) for n, p in zip([q["name"] for q in params], params)}
+        cur = dict(state) if lat is None else {**{p["name"]: torch.clamp(torch.round(lat[p["name"]]), p["lo"], p["hi"]) for p in Q}, **{p["name"]: state[p["name"]] for p in FL}}
+        di_p = {p["name"]: K * z[p["name"]] for p in Q}; df_p = {p["name"]: mw.EPS * z[p["name"]] for p in FL}
         with torch.no_grad():
-            mw.install(params, cur, "direct", {n: K * z[n] for n in cur}, None); Lp = float(TF.cross_entropy(model(xb), yb, reduction="sum"))
-            mw.install(params, cur, "direct", {n: -K * z[n] for n in cur}, None); Lm = float(TF.cross_entropy(model(xb), yb, reduction="sum"))
-        g = (Lp - Lm) / (2.0 * K * mw.N_ACCUM); moved = 0
-        for p in params:
+            mw.install(params, cur, "direct", di_p, df_p); Lp = float(TF.cross_entropy(model(xb), yb, reduction="sum"))
+            mw.install(params, cur, "direct", {n: -v for n, v in di_p.items()}, {n: -v for n, v in df_p.items()}); Lm = float(TF.cross_entropy(model(xb), yb, reduction="sum"))
+        g = (Lp - Lm) / (2.0 * K * mw.N_ACCUM); g_abs = (Lp - Lm) / (2.0 * mw.EPS * mw.N_ACCUM); moved = 0
+        for p in FL: state[p["name"]] = state[p["name"]] + (-lr_f * g_abs) * z[p["name"]]
+        for p in Q:
             n = p["name"]
             if lat is None:
                 d = torch.round(-lr * g * z[n]); state[n] = torch.clamp(state[n] + d, p["lo"], p["hi"]); moved += int((d != 0).sum())
             else: lat[n] = torch.clamp(lat[n] + (-lr * g * z[n]), p["lo"], p["hi"])
         if lat is None and moved == 0: zero_steps += 1
         if u % 300 == 0: mw.log(f"     [{tag}] u{u} L+={Lp:.4f} L-={Lm:.4f} g={g:+.4f}")
-    final = state if lat is None else {n: torch.clamp(torch.round(lat[n]), p["lo"], p["hi"]) for n, p in zip([q["name"] for q in params], params)}
+    final = dict(state) if lat is None else {**{p["name"]: torch.clamp(torch.round(lat[p["name"]]), p["lo"], p["hi"]) for p in Q}, **{p["name"]: state[p["name"]] for p in FL}}
     with torch.no_grad(): mw.install(params, final, "direct", None, None)
     acc = mw.evaluate(model, evX, evY); tot = sum(int(init_int[n].numel()) for n in conv_w)
     mv = 100.0 * sum(int((final[n] != init_int[n]).sum()) for n in conv_w) / tot
-    r = dict(mode=mode, lr_lsb=lr, K_lsb=K, n_steps=n_steps, balanced_accuracy=acc["balanced_accuracy"], overall_accuracy=acc["overall_accuracy"],
+    r = dict(mode=mode, lr_lsb=lr, K_lsb=K, lr_f=lr_f if FL else None, n_steps=n_steps, balanced_accuracy=acc["balanced_accuracy"], overall_accuracy=acc["overall_accuracy"],
              cum_convW_moved_pct=mv, pct_steps_zero_move=100.0 * zero_steps / n_steps, seconds=time.time() - t0)
     mw.log(f"[{tag}] DONE bal_acc={r['balanced_accuracy']:.2f}%  convW moved={mv:.1f}%  zero-move steps={r['pct_steps_zero_move']:.1f}%  ({r['seconds']:.0f}s)")
     return r

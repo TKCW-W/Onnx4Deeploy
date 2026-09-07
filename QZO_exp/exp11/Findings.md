@@ -1,7 +1,7 @@
 # exp11 — Findings (interim, 2026-09-06 17:30 CEST)
 
 Branch `feat/QZO`. Deliverable: device ↔ host-reference bit-exactness (under the float-ZO tolerance) over a full
-round-1. **Status: not yet achieved.** What was accepted, what was measured, what was refuted, and what is pending.
+round-1. **Status (2026-09-07 05:40): ACHIEVED under the float-ZO tolerance — strict-fp32 device round-1 = 0 / 21,600 errors, no LARGE step, ≤1-ulp residual (see §7).** What was accepted, what was measured, what was refuted, and what is pending.
 
 ## 1. Accepted changes — host reference made faithful to the device, op for op (`onnx_node_implementations.py`)
 All originals kept commented (`# [exp11-orig]`). Each mirrors the device kernel/template bit-for-bit in fp32.
@@ -78,6 +78,32 @@ difference and amplified by the activation Quant. The int8 weight path adds ×4 
 amplifier. Since every other op is now identical, removing the tail seed (L3/L4) would make the whole carry bit-exact
 (diff = 0). Details: `exp12/Findings.md`, `exp13/Findings.md`. Master-weight question: exp13 is the device-level
 "fp32-only" bound — any scheme that leaves the tail seed in place inherits at least this divergence.
+
+## 7. Accepted fix (route 1) and result — 2026-09-07
+Root cause proven at the micro level (`exp13/micro/FINDINGS.md`): the integer path is bit-exact at every block; the difference is
+created by the compiler's fused/reassociated fp32 arithmetic in `BatchNorm.c` (first) and `Gemm.c` under the PULP SDK's
+`-ffast-math`. Accepted change — an OFF-by-default build option, no kernel or host code change:
+```cmake
+# TargetLibraries/PULPOpen/CMakeLists.txt  (per-source, appended after the target flags so it wins)
+if(DEEPLOY_STRICT_FP32_FILES)
+  foreach(_f IN LISTS DEEPLOY_STRICT_FP32_FILES)
+    set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/${_f} PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+  endforeach()
+endif()
+# DeeployTest/CMakeLists.txt (generated graphs)
+if(DEEPLOY_STRICT_FP32)
+  target_compile_options(training_network PRIVATE -fno-fast-math -ffp-contract=off)
+  target_compile_options(optimizer_network PRIVATE -fno-fast-math -ffp-contract=off)
+endif()
+```
+Enabled for QZO with `-D DEEPLOY_STRICT_FP32=ON "DEEPLOY_STRICT_FP32_FILES=BatchNorm.c;Gemm.c;GlobalAveragePool.c;RandomNoise.c"`.
+`-fno-fast-math` alone is NOT sufficient (only drops to `-ffp-contract=on`; Gemm keeps 133 fused ops); pragmas do nothing
+under the global flag. Cost: ~1 extra instruction per element in BN/Gemm (fc is 288 MACs) — negligible.
+Result (exp13 setting, full 2700-step device round-1 vs host): **0 / 21,600 errors** (fast-math: 5,838), no LARGE step,
+residual ≤ 1 ulp throughout (median 2.8e-8 → 6.6e-8), all int tensors + BN γ bit-exact, BN β / fc differ by exactly 1 ulp on
+a subset — the SCE's picolibc `expf`/`logf` footprint (L4), the one remaining source; not required for the tolerance bar.
+Together with the L1/L2 host mirrors (§1), this is the "same implementation on both sides": deterministic source-order fp32
+on the device, mirrored op-for-op by the host executor.
 
 ## 6. Plan for item 2 — a faithful PyTorch simulation to retune the on-device QZO setting
 The Brevitas fake-quant sim (actor A) is ~2 pt optimistic and diverges from the device at zero-shot (85.00 vs 83.33) because

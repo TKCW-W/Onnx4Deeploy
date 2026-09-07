@@ -52,3 +52,21 @@ forward was not the training forward. Fix = inject `bias_rqsadd − div/2` (done
 
 Files: `make_step0_dump.py`, `_rebuild_fixed.py`, `_host_layerwise.py`, `make_probe13.py`, `run_probe_sweep.sh`,
 `analyze_probes.py`, `probe_results.txt`, `probe_summary.txt`, `qzo13_probe_NN.log.gz`, `qinfer_step0_fixed/`.
+
+## Route 1 applied — causal confirmation and full round-1 (2026-09-07 05:40 CEST)
+Build option (OFF by default): `-D DEEPLOY_STRICT_FP32_FILES="BatchNorm.c;Gemm.c;GlobalAveragePool.c;RandomNoise.c"`
+(per-source `-fno-fast-math -ffp-contract=off`, `TargetLibraries/PULPOpen/CMakeLists.txt`) and `-D DEEPLOY_STRICT_FP32=ON`
+(same flags on the generated TrainingNetwork.c / OptimizerNetwork.c, `DeeployTest/CMakeLists.txt`).
+| test | fast-math | strict |
+|---|---|---|
+| probe BN-0 (78,512 elements), strict BatchNorm.c only | 19,841 differ | **0** |
+| probe logits (9), strict BatchNorm.c only / + Gemm.c | 7 differ / — | 6 (fc FMA) / **0** |
+| tiled 2-step training smoke, step-0 loss vs host (4 accum), all strict | [5, 1, 15, 5] ulp | **[0, 1, 0, 0] ulp** |
+| **full round-1, 2700 steps, lr 3e-6, conv frozen: errors / 21,600** | 5,838 | **0** |
+| first LARGE step (L+ / L−) | 181 / 204 | **none** |
+| median rel. residual, steps 0–25 → 1200–2700 | 6e-7 → 1e-2 | **2.8e-8 → 6.6e-8 (≤ 1 ulp, no amplification)** |
+| final params device vs host | 12 fp32 tensors differ up to 6.8e-4 | 15/22 bit-exact (all int + BN γ); BN β, fc differ on a subset by **exactly 1 ulp** (1.49e-8 / 2.24e-8) |
+The only remaining source of difference is the SCE's picolibc `expf`/`logf` (1 ulp on the loss, ~85–95% of forwards), which
+propagates into the fp32 parameters at ~1 ulp and does not amplify over the round. A `diff = 0` carry would additionally need
+one deterministic `expf`/`logf` on both sides (L4). Logs: `device_round1_3e6_freeze_strict.log.gz`, `strict_round1_analysis.txt`,
+`device_weights_3e6_freeze_strict.npz`, `smoke_2step_strict.log.gz`, `qzo13_probe_*_strict*.log.gz`.

@@ -1,0 +1,27 @@
+########## STRICT fp32 (BatchNorm/Gemm/GAP/RandomNoise + generated graphs), lr 3e-6, conv frozen — FULL round-1 ##########
+harness line     : Errors: 21347 out of 21600
+  loss_plus : n=10800  |diff|>0.001:     0 (  0.0%)   first LARGE step: None
+         steps bit-exact ulp(<1e-5)   LARGE  median rel
+       0-  25      4.0%      96.0%    0.0%    2.78e-08
+      25- 100     18.7%      81.3%    0.0%    2.95e-08
+     100- 300     14.5%      85.5%    0.0%    3.25e-08
+     300- 600     14.0%      86.0%    0.0%    3.72e-08
+     600-1200     14.8%      85.2%    0.0%    3.78e-08
+    1200-2700      5.5%      94.5%    0.0%    6.22e-08
+  loss_minus: n=10800  |diff|>0.001:     0 (  0.0%)   first LARGE step: None
+         steps bit-exact ulp(<1e-5)   LARGE  median rel
+       0-  25     24.0%      76.0%    0.0%    2.23e-08
+      25- 100     13.3%      86.7%    0.0%    3.56e-08
+     100- 300     14.0%      86.0%    0.0%    3.40e-08
+     300- 600     12.7%      87.3%    0.0%    3.75e-08
+     600-1200     15.2%      84.8%    0.0%    3.90e-08
+    1200-2700      7.1%      92.9%    0.0%    6.56e-08
+  recomputed harness count: 0 out of 21600
+  DIFF blocks.0.bn.bias: n=6 max=1.490e-08
+  DIFF blocks.1.bn.bias: n=13 max=1.490e-08
+  DIFF blocks.2.bn.bias: n=11 max=1.490e-08
+  DIFF blocks.3.bn.bias: n=25 max=1.490e-08
+  DIFF blocks.4.bn.bias: n=21 max=1.490e-08
+  DIFF fc.weight_fp32: n=101 max=2.235e-08
+  DIFF fc.bias_fp32: n=9 max=1.490e-08
+[extract] vs reference updated_*: 15 bit-exact, 7 differ, 0 not found in reference

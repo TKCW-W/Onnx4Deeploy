@@ -28,13 +28,22 @@ direct 3e-6/1e-5/3e-5/1e-4 → 75.6 / 83.3 / 57.8 / 27.2%; master 3e-6/1e-5/3e-5
 | master_lsb | 1 | 1 / **3** / 10 | 86.1 / **87.2** / 86.7% | 75 / 91 / 97% |
 | master_lsb | 2 | 0.3 / 1 / 3 | 85.0 / 86.7 / 86.7% | 30 / 73 / 90% |
 
+## 3b. fc-float folded variant (fc as fp32 `nn.Linear`, smooth float ZO path; conv LSB-domain; pooled@100, zero-shot 85.56%)
+| regime | bal. acc |
+|---|---|
+| absolute eps: master@1e-5 / master@3e-5 / direct@1e-5 | 85.6 / 77.2 / 85.0% |
+| LSB K=1: master_lsb@1 / direct_lsb@3 | **86.7%** / 85.6% (stall) |
+A float fc does not restore the fine-tuning gain: the smooth trainable capacity the unfolded design has is the BN γ/β
+(one gain+bias per channel in every block), not the fc.
+
 ## 4. Conclusion (relative comparison inside one simulator; Brevitas fake-quant is ~2 pt optimistic in absolute terms)
 - **Folded BN + direct-int8 never beats zero-shot** at any eps parametrization or lr: the int8-only update either stalls
   (sub-LSB) or moves ~all weights as a whole-channel ±1-LSB random walk that degrades accuracy. There is no window between.
 - **Folded BN + master weights** gains at most **+1.7 pt (87.2%)**, vs the **unfolded design's +4 (direct@1e-5, 88.3%) / +5
   (master@3e-6, 89.4%)** in the same harness. The unfolded design's gain comes mostly from the fp32 BN γ/β — a smooth,
   low-dimensional, well-conditioned path that ZO fine-tunes effectively and that folding removes.
-- Comparable accuracy to the unfolded design was NOT reached with folded BN in this sweep. If the supervisor's folded
-  setup reaches higher, the difference must be in something not covered here (float fc — pending below; different
+- Comparable accuracy to the unfolded design was NOT reached with folded BN in this sweep (13 regimes over 3 eps
+  parametrizations, 2 fc treatments, direct/master; best folded 87.2% vs unfolded 89.4%). If the supervisor's folded
+  setup reaches higher, the difference must be in something not covered here (different
   perturbation/lr parametrization; larger n_accum; a different calibration/init) and should be pinned by reproducing his
   exact configuration in this harness.

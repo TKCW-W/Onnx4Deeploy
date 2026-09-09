@@ -905,6 +905,21 @@ class BaseONNXExporter(ABC):
                     upd = _perturb_rademacher(P[nm].astype(_np.float32), seed_eff, p["idx"], float(coeff), 1)
                     P[nm] = _np.asarray(upd).reshape(P[nm].shape).astype(_np.float32)
 
+            # QW exp11_bitexact_SCE_verif: env-gated per-step weight+loss trace (default-off).
+            #     Dumps the post-update param dict P (= weights[u]) at steps in [QZO_TRACE_LO,
+            #     QZO_TRACE_HI], matching the device multi-step [WDUMP] semantics, so weights-into
+            #     step u = weights[u-1] and increment[u] = weights[u]-weights[u-1] are comparable
+            #     device vs host. Absent env => no behaviour change. -- QW
+            _tlo = _os.environ.get("QZO_TRACE_LO"); _thi = _os.environ.get("QZO_TRACE_HI")
+            if _tlo is not None and _thi is not None and int(_tlo) <= u <= int(_thi):
+                _td = _os.environ.get("QZO_TRACE_DIR", "/tmp/qzo_trace"); _os.makedirs(_td, exist_ok=True)
+                _np.savez(_os.path.join(_td, f"P_step{u}.npz"),
+                          **{k: _np.asarray(v) for k, v in P.items()})
+                with open(_os.path.join(_td, "loss_trace.txt"), "a") as _lf:
+                    _lf.write(f"step {u} acc={float(acc):.9e} g_proj={float(g_proj):.9e} "
+                              f"coeff={float(coeff):.9e} Lp_last={float(Lp):.9e} Lm_last={float(Lm):.9e}\n")
+                print(f"     [QZO_TRACE] dumped P at step {u} -> {_td}/P_step{u}.npz", flush=True)
+
         _val_by_name = {"input": Xw[0], "label": Yw[0], **param_inputs}
         save = {f"arr_{_gi:04d}": _val_by_name[nm] for _gi, nm in enumerate(input_order)}
         for k in range(1, data_size):                          # float-ZO mb-key convention

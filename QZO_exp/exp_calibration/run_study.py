@@ -40,7 +40,9 @@ from calib_pooled import (act_sites, collect_pooled, freeze_act_thresholds,
                           int_scaling_of, read_act_scales, thresholds_from_pool,
                           PooledAbsCollector, ConstThreshold)
 
-CKPT = ("/app/SilentWear/SilentWear/artifacts/models/inter_session_ft/S01/vocalized/"
+# QW (exp18/exp19): see stability_lib.py -- base weights now artifacts_reference/. -- QW
+_ARTIFACTS = os.environ.get("QZO_ARTIFACTS_DIR", "artifacts_reference")
+CKPT = (f"/app/SilentWear/SilentWear/{_ARTIFACTS}/models/inter_session_ft/S01/vocalized/"
         "speechnet/w1400ms/model_1/leave_one_session_out_fold_3.pt")
 DATA_PATH = "/app/SilentWear/SilentWear_data/data_raw_and_filt"
 

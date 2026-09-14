@@ -15,10 +15,15 @@ EXP_CALIB = (Path(__file__).resolve().parent.parent / "exp_calibration")
 sys.path.insert(0, str(EXP_CALIB))
 
 import run_study as S           # noqa: E402
+import os
 import run_incremental as RI    # noqa: E402
 import calib_pooled as CP       # noqa: E402
 
-CKPT_DIR = ("/app/SilentWear/SilentWear/artifacts/models/inter_session_ft/"
+# QW (exp18/exp19): the base pretrained weights moved to artifacts_reference/ (the lab-machine
+#     reproduction that matches the paper). Overridable so the superseded artifacts/ runs stay
+#     reproducible: set QZO_ARTIFACTS_DIR=artifacts to get the old behaviour. -- QW
+_ARTIFACTS = os.environ.get("QZO_ARTIFACTS_DIR", "artifacts_reference")
+CKPT_DIR = (f"/app/SilentWear/SilentWear/{_ARTIFACTS}/models/inter_session_ft/"
             "S01/vocalized/speechnet/w1400ms/model_1")
 STEPS = 200 * S.N_TRAIN // S.N_ACCUM     # 2700
 LR_QZO = 1e-5

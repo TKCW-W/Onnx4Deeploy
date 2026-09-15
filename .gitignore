@@ -79,3 +79,9 @@ temp/
 
 # Test outputs
 test_outputs/
+
+# Added 2026-09-15 -- run captures from the QZO experiments; the results they
+# summarise live in the .json/.csv beside them.
+*.stdout
+nohup.out
+*.out

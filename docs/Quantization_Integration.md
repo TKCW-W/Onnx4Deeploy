@@ -1,3 +1,9 @@
+> **Status note (2026-10-12).** Historical plan: the `-mode quant` / `create_brevitas_model` design
+> described here was overtaken by the QZO route (`-mode q-zo-train`, see
+> `TrainDeeploy/HandoverDocuments/03_QZO_Guide.md`). Section 2 remains the only written explanation
+> of the QCDQ → `RequantizedConv` fold chain (`PULPConvRequantMergePass`), which is at the centre of
+> both `+div/2` rounding bugs, so the file is kept.
+
 # Quantization Integration with DeepQuant + Deeploy
 
 > *How quantized ONNX export fits into the Onnx4Deeploy → DeepQuant → Deeploy toolchain, and how to add a new quantized model.*

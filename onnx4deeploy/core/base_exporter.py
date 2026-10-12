@@ -824,9 +824,22 @@ class BaseONNXExporter(ABC):
         #     (data_size // n_accum steps — e.g. exp8's 2-step smoke fixture). Windows always
         #     cycle mb % data_size, so inputs.npz stays at data_size entries either way. -- QW
         _nb = int(self.config.get("n_batches") or 0)
-        n_steps = max(max(1, data_size // max(n_accum, 1)), _nb // max(n_accum, 1))
+        # n_steps = max(max(1, data_size // max(n_accum, 1)), _nb // max(n_accum, 1))
+        # QW 2026-10-12: an EXPLICIT --n-steps/--n-epochs/--n-batches is honoured even when it is shorter
+        #     than one pass over the pool (single-step fixture = round 1's first step); the old minimum of
+        #     one pass applies only when no length was requested (exp8-style smoke fixtures). Round-1
+        #     exports (--n-epochs 200) are unchanged: n_steps = n_batches // n_accum as before. -- QW
+        if self.config.get("n_batches_explicit") and _nb:
+            n_steps = max(1, _nb // max(n_accum, 1))
+        else:
+            n_steps = max(max(1, data_size // max(n_accum, 1)), _nb // max(n_accum, 1))
         num_classes = self.config.get("num_classes", 2)
         Xw_l, Yw_l = self.get_data_source().load_batches(data_size, (1,) + tuple(ishape[1:]), num_classes, seed=42)
+        # QW 2026-10-12: keep only the windows the reference consumes when it is shorter than one pass,
+        #     so inputs.npz carries just those (same rule as the BP/ZO fixtures). -- QW
+        if n_steps * max(n_accum, 1) < data_size:
+            data_size = n_steps * max(n_accum, 1)
+            Xw_l, Yw_l = Xw_l[:data_size], Yw_l[:data_size]
         Xw = [_np.asarray(a, _np.float32) for a in Xw_l]
         Yw = [_np.asarray(l, _np.int64).reshape(1, 1) for l in Yw_l]
         _meta_model, _meta_scale = _bif(onnx.load(net))

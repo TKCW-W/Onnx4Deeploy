@@ -430,6 +430,9 @@ def generate_model(
         # Create exporter
         exporter = model_class(save_path=output_path)
 
+        # QW 2026-10-12: remember whether a training length was REQUESTED (vs the default 4 below), so
+        #     the QZO reference can honour --n-steps shorter than one pass over the --data-size pool. -- QW
+        n_batches_explicit = any(v is not None for v in (n_batches, n_steps, n_epochs))
         # Resolve n_batches from whichever training-length parameter was given.
         # Priority: --n-batches > --n-steps > --n-epochs > default(4)
         if mode in ("train", "train_single_step", "zo-train", "q-zo-train"):  # QW: ZO/QZO fixtures need the step count too -- QW
@@ -463,6 +466,7 @@ def generate_model(
         exporter._config_overrides = {}
         if mode in ("train", "train_single_step", "zo-train", "q-zo-train"):  # QW: thread step count into ZO/QZO fixture -- QW
             exporter._config_overrides["n_batches"] = n_batches
+            exporter._config_overrides["n_batches_explicit"] = n_batches_explicit  # -- QW 2026-10-12
             exporter._config_overrides["n_accum"] = n_accum
             exporter._config_overrides["batch_size"] = batch_size
             if learning_rate is not None:

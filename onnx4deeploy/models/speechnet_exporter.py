@@ -430,9 +430,17 @@ class SpeechNetExporter(BaseONNXExporter):
 
         # Use real data set from SilentWear for training data
         data_source = self.get_data_source()
-        test_inputs, labels_list = data_source.load_batches(
-            effective_data_size, input_shape, num_classes, seed=42
-        )
+        # test_inputs, labels_list = data_source.load_batches(
+        #     effective_data_size, input_shape, num_classes, seed=42
+        # )
+        # QW 2026-10-12: draw the FULL --data-size pool even when fewer forwards are requested, then keep
+        #     only the windows the device consumes (mb % pool for mb < n_batches = the first n_batches).
+        #     A single-step export (--n-steps 1 --n-accum 1 --data-size 54 --stratified) thus uses exactly
+        #     window 0 of the round-1 pool instead of failing the 9-class stratified draw. Unchanged when
+        #     n_batches >= data_size (every round-1 export). -- QW
+        _pool = int(_data_size_cfg) if _data_size_cfg else n_batches
+        test_inputs, labels_list = data_source.load_batches(_pool, input_shape, num_classes, seed=42)
+        test_inputs, labels_list = test_inputs[:effective_data_size], labels_list[:effective_data_size]
 
         init_map: dict = self._load_init_map(self.paths["network_infer"])
 
@@ -676,9 +684,14 @@ class SpeechNetExporter(BaseONNXExporter):
               f"q={q} lr={lr} eps={eps} seed={seed}")
 
         data_source = self.get_data_source()
-        test_inputs, labels_list = data_source.load_batches(
-            effective_data_size, input_shape, num_classes, seed=42
-        )
+        # test_inputs, labels_list = data_source.load_batches(
+        #     effective_data_size, input_shape, num_classes, seed=42
+        # )
+        # QW 2026-10-12: same pool rule as the BP fixture above -- draw the full --data-size pool and
+        #     keep the windows actually consumed, so a single-step ZO export uses round 1's window 0. -- QW
+        _pool = int(_dc) if _dc else n_batches
+        test_inputs, labels_list = data_source.load_batches(_pool, input_shape, num_classes, seed=42)
+        test_inputs, labels_list = test_inputs[:effective_data_size], labels_list[:effective_data_size]
         init_map = self._load_init_map(self.paths["network_infer"])
 
         # Per-param node_id from zo_train (== zo_update after the idx-consistency fix).

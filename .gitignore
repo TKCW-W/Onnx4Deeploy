@@ -85,3 +85,11 @@ test_outputs/
 *.stdout
 nohup.out
 *.out
+
+# -- QW 2026-10-12: private progress notes (kept locally, not shared). Shared documentation lives in
+#    TrainDeeploy/HandoverDocuments; README.md and docs/ (except docs/archive) stay tracked.
+/QZO_exp/**/*.md
+/ZO_PORT_FINDINGS.md
+/PLAN.md
+/ZO_NATIVE_EXPORT_PLAN.md
+/docs/archive/
